@@ -41,7 +41,7 @@ class Credentials(BaseModel):
 
 class SubscribeBody(BaseModel):
     strategy_id: str
-    symbol: str = Field(default="RELIANCE", pattern=r"^[A-Z][A-Z0-9.-]{1,19}$")
+    symbol: Optional[str] = Field(default=None, pattern=r"^[A-Z][A-Z0-9.-]{1,19}$")
 
 
 class RiskBody(BaseModel):
@@ -172,17 +172,18 @@ def subscribe(body: SubscribeBody, user: User = Depends(current_user), db: Sessi
     account = user_account(user, db)
     strategy = db.get(Strategy, body.strategy_id)
     if not strategy: raise HTTPException(404, "Strategy not found")
+    symbol = body.symbol or settings.alpaca_default_symbol
     existing = db.scalar(select(Subscription).where(Subscription.account_id == account.id, Subscription.strategy_id == body.strategy_id))
     if existing:
-        if existing.symbol != body.symbol:
+        if existing.symbol != symbol:
             has_position = db.scalar(select(func.count(Position.id)).where(Position.subscription_id == existing.id, Position.quantity != 0)) or 0
             has_open_order = db.scalar(select(func.count(Order.id)).where(Order.subscription_id == existing.id, Order.status.not_in(["FILLED", "CANCELLED", "REJECTED", "RISK_REJECTED"]))) or 0
             if existing.status == "RUNNING" or has_position or has_open_order:
                 raise HTTPException(409, "Pause the strategy, flatten its position, and resolve open orders before changing its symbol")
-            existing.symbol = body.symbol
+            existing.symbol = symbol
             db.commit()
         return sub_json(db, existing)
-    sub = Subscription(account_id=account.id, strategy_id=strategy.id, symbol=body.symbol, parameters=strategy.default_parameters)
+    sub = Subscription(account_id=account.id, strategy_id=strategy.id, symbol=symbol, parameters=strategy.default_parameters)
     db.add(sub); db.commit(); db.refresh(sub)
     return sub_json(db, sub)
 
@@ -247,9 +248,37 @@ def risk_events(user: User = Depends(current_user), db: Session = Depends(get_db
 
 
 @app.get("/api/v1/candles")
-def candles(symbol: str = "RELIANCE", timeframe: str = "1m", user: User = Depends(current_user), db: Session = Depends(get_db)):
+def candles(symbol: Optional[str] = None, timeframe: str = "1m", user: User = Depends(current_user), db: Session = Depends(get_db)):
+    symbol = symbol or settings.alpaca_default_symbol
     rows = db.scalars(select(Candle).where(Candle.symbol == symbol, Candle.timeframe == timeframe).order_by(Candle.bucket_start.desc()).limit(100)).all()
     return [{"time": iso(c.bucket_start), "open": num(c.open), "high": num(c.high), "low": num(c.low), "close": num(c.close), "volume": c.volume, "closed": c.closed} for c in reversed(rows)]
+
+
+@app.get("/api/v1/market-feed")
+def market_feed(user: User = Depends(current_user), db: Session = Depends(get_db)):
+    """A compact, user-visible view of the real market data powering strategies."""
+    account = user_account(user, db)
+    session = db.get(SimulatorSession, account.id)
+    symbols = sorted(set(db.scalars(select(Subscription.symbol).where(Subscription.account_id == account.id)).all()))
+    items = []
+    for symbol in symbols:
+        rows = db.scalars(select(Candle).where(
+            Candle.symbol == symbol, Candle.timeframe == "1m"
+        ).order_by(Candle.bucket_start.desc()).limit(3)).all()
+        current = next((row for row in rows if not row.closed), None)
+        closed = next((row for row in rows if row.closed), None)
+        def candle_json(row):
+            return None if not row else {
+                "time": iso(row.bucket_start), "open": num(row.open), "high": num(row.high),
+                "low": num(row.low), "close": num(row.close), "volume": row.volume, "closed": row.closed,
+            }
+        latest = current or closed
+        items.append({"symbol": symbol, "latest_price": num(latest.close) if latest else None, "current_candle": candle_json(current), "last_closed_candle": candle_json(closed)})
+    return {
+        "provider": "Alpaca IEX" if settings.is_alpaca_paper else "Deterministic simulator",
+        "active": bool(session and session.active),
+        "symbols": items,
+    }
 
 
 @app.post("/api/v1/simulator/orders")
