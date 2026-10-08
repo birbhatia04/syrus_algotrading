@@ -15,7 +15,7 @@ services:
     command: alembic upgrade head
     environment:
       DATABASE_URL: postgresql+psycopg://aegis:aegis_local_only@db:5432/aegis
-      ENVIRONMENT: SIMULATOR
+      ENVIRONMENT: ${ENVIRONMENT:-SIMULATOR}
     depends_on:
       db:
         condition: service_healthy
@@ -23,7 +23,11 @@ services:
     build: ./backend
     environment:
       DATABASE_URL: postgresql+psycopg://aegis:aegis_local_only@db:5432/aegis
-      ENVIRONMENT: SIMULATOR
+      ENVIRONMENT: ${ENVIRONMENT:-SIMULATOR}
+      ALPACA_API_KEY_ID: ${ALPACA_API_KEY_ID:-}
+      ALPACA_API_SECRET_KEY: ${ALPACA_API_SECRET_KEY:-}
+      ALPACA_DATA_FEED: ${ALPACA_DATA_FEED:-iex}
+      ALPACA_DEFAULT_SYMBOL: ${ALPACA_DEFAULT_SYMBOL:-AAPL}
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -33,7 +37,11 @@ services:
     command: python -m app.worker
     environment:
       DATABASE_URL: postgresql+psycopg://aegis:aegis_local_only@db:5432/aegis
-      ENVIRONMENT: SIMULATOR
+      ENVIRONMENT: ${ENVIRONMENT:-SIMULATOR}
+      ALPACA_API_KEY_ID: ${ALPACA_API_KEY_ID:-}
+      ALPACA_API_SECRET_KEY: ${ALPACA_API_SECRET_KEY:-}
+      ALPACA_DATA_FEED: ${ALPACA_DATA_FEED:-iex}
+      ALPACA_DEFAULT_SYMBOL: ${ALPACA_DEFAULT_SYMBOL:-AAPL}
     depends_on:
       migrate:
         condition: service_completed_successfully

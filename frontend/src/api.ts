@@ -10,5 +10,5 @@ export async function api<T>(path:string, options:RequestInit={}):Promise<T>{
   }
   return data
 }
-export const money=(n:number)=>new Intl.NumberFormat('en-IN',{style:'currency',currency:'INR',minimumFractionDigits:2}).format(n)
+export const money=(n:number,currency='INR')=>new Intl.NumberFormat(currency==='USD'?'en-US':'en-IN',{style:'currency',currency,minimumFractionDigits:2}).format(n)
 export const dt=(s:string)=>new Intl.DateTimeFormat('en-IN',{dateStyle:'medium',timeStyle:'short',timeZone:'Asia/Kolkata'}).format(new Date(s))

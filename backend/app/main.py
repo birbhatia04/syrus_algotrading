@@ -173,7 +173,15 @@ def subscribe(body: SubscribeBody, user: User = Depends(current_user), db: Sessi
     strategy = db.get(Strategy, body.strategy_id)
     if not strategy: raise HTTPException(404, "Strategy not found")
     existing = db.scalar(select(Subscription).where(Subscription.account_id == account.id, Subscription.strategy_id == body.strategy_id))
-    if existing: return sub_json(db, existing)
+    if existing:
+        if existing.symbol != body.symbol:
+            has_position = db.scalar(select(func.count(Position.id)).where(Position.subscription_id == existing.id, Position.quantity != 0)) or 0
+            has_open_order = db.scalar(select(func.count(Order.id)).where(Order.subscription_id == existing.id, Order.status.not_in(["FILLED", "CANCELLED", "REJECTED", "RISK_REJECTED"]))) or 0
+            if existing.status == "RUNNING" or has_position or has_open_order:
+                raise HTTPException(409, "Pause the strategy, flatten its position, and resolve open orders before changing its symbol")
+            existing.symbol = body.symbol
+            db.commit()
+        return sub_json(db, existing)
     sub = Subscription(account_id=account.id, strategy_id=strategy.id, symbol=body.symbol, parameters=strategy.default_parameters)
     db.add(sub); db.commit(); db.refresh(sub)
     return sub_json(db, sub)
@@ -207,7 +215,8 @@ def dashboard(user: User = Depends(current_user), db: Session = Depends(get_db))
     account = user_account(user, db); totals = aggregate_account(db, account.id)
     orders = db.scalars(select(Order).where(Order.account_id == account.id).order_by(Order.created_at.desc()).limit(6)).all()
     subs = db.scalars(select(Subscription).where(Subscription.account_id == account.id)).all()
-    return {"environment": settings.environment, "account": {"id": account.id, "name": account.name, "kill_state": account.kill_state, "recovered": account.recovered, "worker_heartbeat": iso(account.worker_heartbeat)}, "pnl": {k: num(v) for k, v in totals.items() if k != "positions"}, "aggregate_positions": totals["positions"], "running_strategies": sum(1 for s in subs if s.status == "RUNNING"), "subscriptions": len(subs), "recent_orders": [order_json(o) for o in orders]}
+    session = db.get(SimulatorSession, account.id)
+    return {"environment": settings.environment, "currency": settings.currency, "default_symbol": settings.alpaca_default_symbol if settings.is_alpaca_paper else "RELIANCE", "feed_active": bool(session and session.active), "account": {"id": account.id, "name": account.name, "kill_state": account.kill_state, "recovered": account.recovered, "worker_heartbeat": iso(account.worker_heartbeat)}, "pnl": {k: num(v) for k, v in totals.items() if k != "positions"}, "aggregate_positions": totals["positions"], "running_strategies": sum(1 for s in subs if s.status == "RUNNING"), "subscriptions": len(subs), "recent_orders": [order_json(o) for o in orders]}
 
 
 @app.get("/api/v1/orders")
@@ -294,12 +303,16 @@ def simulator_events(user: User = Depends(current_user), db: Session = Depends(g
 @app.post("/api/v1/simulator/stream/{action}")
 def simulator_stream(action: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
     if action not in {"start", "stop"}: raise HTTPException(404, "Unknown stream action")
+    if settings.is_alpaca_paper and not settings.alpaca_configured:
+        raise HTTPException(409, "Alpaca Paper credentials are not configured on the backend")
     account = user_account(user, db)
     session = db.get(SimulatorSession, account.id) or SimulatorSession(account_id=account.id)
     session.active = action == "start"
     if session.active and not session.virtual_time:
         session.virtual_time = datetime.now(timezone.utc).replace(second=0, microsecond=0)
-    db.add(session); record_simulation_event(db, account.id, "STREAM", f"Virtual market stream {action}ed", "One simulated minute advances every two seconds")
+    label = "Alpaca market feed" if settings.is_alpaca_paper else "Virtual market stream"
+    detail = "Alpaca IEX WebSocket trades feed closed-candle strategies" if settings.is_alpaca_paper else "One simulated minute advances every two seconds"
+    db.add(session); record_simulation_event(db, account.id, "STREAM", f"{label} {action}ed", detail)
     db.commit()
     return {"active": session.active, "virtual_time": iso(session.virtual_time)}
 

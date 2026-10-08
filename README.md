@@ -2,7 +2,7 @@
 
 AlgoRhythm is a simulator-first algorithmic trading platform. It demonstrates safe strategy execution, risk enforcement, partial-fill accounting, per-strategy positions, P&L, recovery controls, and an account-level kill switch without connecting to a real broker.
 
-**Mode:** Simulator only. No real orders are sent and the 021 adapter remains disabled until official sandbox documentation and credentials are available.
+**Modes:** `SIMULATOR` (default, deterministic) and `ALPACA_PAPER` (real US market-data streaming with Alpaca Paper orders). No live-money orders are supported.
 
 ## Run locally
 
@@ -19,6 +19,27 @@ docker compose up --build
 Open `http://localhost:5173`.
 
 Docker starts PostgreSQL, the migration service, API, execution worker, Redis, and frontend. Use `Ctrl+C` to stop the stack, or `docker compose down` to stop and remove containers while retaining database data.
+
+### Alpaca Paper Trading mode
+
+The default Docker mode is the safe deterministic simulator. To use the Alpaca integration, first create or rotate **paper** credentials in Alpaca, then create a local `.env` file from `.env.example` and set:
+
+```env
+ENVIRONMENT=ALPACA_PAPER
+ALPACA_API_KEY_ID=your_paper_key_id
+ALPACA_API_SECRET_KEY=your_paper_secret_key
+ALPACA_DATA_FEED=iex
+ALPACA_DEFAULT_SYMBOL=AAPL
+```
+
+Never put these values in the frontend, README, or Git. Then restart the stack:
+
+```bash
+docker compose down
+docker compose up --build
+```
+
+In the UI, subscribe a strategy to `AAPL`, start it, then select **Start Alpaca feed** on Overview. The worker receives Alpaca IEX trades over WebSocket, builds closed candles, evaluates strategies, submits approved market orders to the Alpaca **paper** endpoint, and reconciles confirmed Alpaca fills into AlgoRhythm.
 
 ### Option 2: Local development
 
@@ -75,11 +96,12 @@ Open `http://localhost:5173` and create an account.
 - Controlled virtual market stream that advances one simulated minute every two seconds.
 - Account kill switch that stops strategies, cancels open orders, closes attributed positions, and requires explicit resume after a safe reconciliation.
 - FastAPI backend, SQLAlchemy models, PostgreSQL Docker setup, Alembic migration bootstrap, React/Vite frontend, and backend invariant tests.
+- Alpaca Paper Trading adapter: backend-only API credentials, US market-data WebSocket feed, AAPL candle construction, paper-order submission, idempotent activity-fill reconciliation, and USD display.
 
 ## Not implemented yet
 
-- Verified 021 sandbox or real broker integration. Official API documentation and sandbox credentials are required before implementing authentication, market data, order submission, fills, charges, cancellation, and reconciliation mappings.
-- Real exchange market data and real-money order routing.
+- Verified 021 sandbox or broker integration. Official API documentation and sandbox credentials are required before implementing its authentication, market data, order submission, fills, charges, cancellation, and reconciliation mappings.
+- Real-money order routing. Alpaca integration is deliberately locked to its paper endpoint.
 - Production deployment, secret manager, monitoring, backups, alerting, and audit/outbox infrastructure.
 - PostgreSQL row-level locking for concurrent multi-worker risk admission.
 - Redis-backed live price cache and rate-counter acceleration.

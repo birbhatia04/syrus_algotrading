@@ -21,7 +21,10 @@ class DeterministicSimulatorBroker:
         if acknowledgement.status == "REJECTED" or scenario == "pending": return []
         partial_quantity = max(1, quantity * 40 // 100)
         if scenario == "partial":
-            quantities = [partial_quantity, quantity - partial_quantity]
+            # A partial-fill scenario represents the market executing only the
+            # first available quantity.  The unfilled balance stays on the
+            # acknowledged order; cancellation is covered by cancel_race.
+            quantities = [partial_quantity]
         elif scenario == "cancel_race":
             quantities = [partial_quantity]
         else:

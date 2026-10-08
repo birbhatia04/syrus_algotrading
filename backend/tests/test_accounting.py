@@ -1,8 +1,8 @@
 from decimal import Decimal
 from sqlalchemy import select
 from app.database import SessionLocal
-from app.models import Execution, Position
-from app.services import apply_fill
+from app.models import Account, Execution, Position, Subscription
+from app.services import apply_fill, submit_order
 
 
 def setup_running(client, auth):
@@ -28,6 +28,33 @@ def test_partial_fill_and_duplicate_execution_are_exact(client, auth):
         assert position.quantity == 100
         assert position.average_price == Decimal("100.6000")
         assert db.query(Execution).count() == 2
+
+
+def test_partial_scenario_leaves_the_unfilled_balance_pending(client, auth):
+    sub = setup_running(client, auth)[0]
+    order = client.post("/api/v1/simulator/orders", headers=auth, json={
+        "subscription_id": sub["id"], "side": "BUY", "quantity": 10, "price": 100, "scenario": "partial"
+    }).json()
+    assert order["status"] == "PARTIALLY_FILLED"
+    assert order["filled_qty"] == 4
+    assert order["requested_qty"] == 10
+
+
+def test_alpaca_paper_submission_uses_broker_ack_without_simulated_fill(client, auth, monkeypatch):
+    from app.brokers.contracts import BrokerAcknowledgement
+    from app.config import settings
+    from app import services
+
+    sub = setup_running(client, auth)[0]
+    monkeypatch.setattr(settings, "environment", "ALPACA_PAPER")
+    monkeypatch.setattr(services.alpaca_paper_broker, "place_order", lambda request: BrokerAcknowledgement("alpaca-order-1", "ACKNOWLEDGED"))
+    with SessionLocal() as db:
+        account = db.get(Account, 1)
+        subscription = db.get(Subscription, sub["id"])
+        order = submit_order(db, account, subscription, "BUY", 10, Decimal("100"), client_id="alpaca-test-1")
+        assert order.broker_order_id == "alpaca-order-1"
+        assert order.status == "ACKNOWLEDGED"
+        assert order.filled_qty == 0
 
 
 def test_opposing_strategies_reconcile_and_kill_flattens(client, auth):

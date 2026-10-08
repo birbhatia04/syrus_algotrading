@@ -7,8 +7,9 @@ from typing import Optional, Tuple
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
-from .brokers import simulator_broker
+from .brokers import alpaca_paper_broker, simulator_broker
 from .brokers.contracts import BrokerOrderRequest
+from .config import settings
 from .models import Account, AuditEvent, Candle, Execution, Order, Position, RiskEvent, SimulationEvent, Strategy, Subscription
 
 MONEY = Decimal("0.0001")
@@ -110,14 +111,14 @@ def position_values(position: Position):
     return unrealized, net
 
 
-def apply_fill(db: Session, order: Order, execution_id: str, qty: int, price: Decimal) -> bool:
+def apply_fill(db: Session, order: Order, execution_id: str, qty: int, price: Decimal, charge_rate: Decimal = Decimal("0.0005")) -> bool:
     """Apply one incremental execution atomically. Unique execution IDs make replay a no-op."""
     if qty <= 0 or order.filled_qty + qty > order.requested_qty:
         raise ValueError("Invalid incremental execution quantity")
     if db.scalar(select(Execution).where(Execution.account_id == order.account_id, Execution.execution_id == execution_id)):
         return False
     price = d(price)
-    charge = d(price * qty * Decimal("0.0005"))
+    charge = d(price * qty * charge_rate)
     execution = Execution(account_id=order.account_id, order_id=order.id, execution_id=execution_id, quantity=qty, price=price, charge=charge)
     db.add(execution)
     position = db.scalar(select(Position).where(Position.account_id == order.account_id, Position.subscription_id == order.subscription_id, Position.symbol == order.symbol))
@@ -191,7 +192,8 @@ def submit_order(db: Session, account: Account, subscription: Subscription, side
             _, net = position_values(position)
             if net <= -d(subscription.max_daily_loss):
                 return reject_risk(db, account.id, subscription.id, "DAILY_LOSS", "Daily net loss limit reached", client_id, subscription.symbol, side, qty)
-    ack = simulator_broker.place_order(BrokerOrderRequest(client_id, subscription.symbol, side, qty), scenario)
+    request = BrokerOrderRequest(client_id, subscription.symbol, side, qty)
+    ack = alpaca_paper_broker.place_order(request) if settings.is_alpaca_paper else simulator_broker.place_order(request, scenario)
     order = Order(account_id=account.id, subscription_id=subscription.id, client_order_id=client_id, broker_order_id=ack.broker_order_id, symbol=subscription.symbol, side=side, requested_qty=qty, reserved_qty=qty, status=ack.status, reason=ack.reason, close_only=close_only)
     db.add(order)
     db.commit()
@@ -200,16 +202,62 @@ def submit_order(db: Session, account: Account, subscription: Subscription, side
     if ack.status == "REJECTED":
         order.reserved_qty = 0
         db.commit()
+    elif settings.is_alpaca_paper:
+        record_simulation_event(db, account.id, "ORDER_ACK", f"Alpaca Paper accepted {side} {qty} {subscription.symbol}", "Awaiting Alpaca order and fill reconciliation")
+        db.commit()
     else:
         for execution in simulator_broker.execution_plan(ack, qty, price, scenario):
             apply_fill(db, order, execution.execution_id, execution.incremental_quantity, execution.price)
             record_simulation_event(db, account.id, "FILL", f"{execution.incremental_quantity} {subscription.symbol} filled", f"{side} at ₹{execution.price}")
+        if scenario == "partial":
+            record_simulation_event(
+                db,
+                account.id,
+                "PARTIALLY_FILLED",
+                f"{order.filled_qty} of {order.requested_qty} {subscription.symbol} filled",
+                f"Remaining {order.reserved_qty} quantity is pending",
+            )
         if scenario == "cancel_race":
             order.status = "CANCELLED"
             order.reserved_qty = 0
             record_simulation_event(db, account.id, "CANCELLED", f"Remaining {subscription.symbol} quantity cancelled", "Cancellation raced with a confirmed partial fill")
         db.commit()
     return order
+
+
+def mark_symbol(db: Session, account_id: int, symbol: str, price: Decimal):
+    """Mark each strategy sub-ledger to the most recent broker trade."""
+    for position in db.scalars(select(Position).where(Position.account_id == account_id, Position.symbol == symbol)).all():
+        position.last_price = d(price)
+    db.commit()
+
+
+def reconcile_alpaca_orders(db: Session, account: Account):
+    """Apply Alpaca activity fills exactly once and mirror terminal order states."""
+    orders = db.scalars(select(Order).where(
+        Order.account_id == account.id,
+        Order.broker_order_id.is_not(None),
+        Order.status.not_in(TERMINAL),
+    )).all()
+    for order in orders:
+        try:
+            snapshot = alpaca_paper_broker.order(order.broker_order_id)
+            for fill in alpaca_paper_broker.fills(order.broker_order_id):
+                # Alpaca reports commission-free paper fills. Broker fees are not invented.
+                apply_fill(db, order, fill.execution_id, fill.quantity, fill.price, Decimal("0"))
+            db.refresh(order)
+            order.status = snapshot.status
+            order.reason = snapshot.reason
+            if snapshot.status in TERMINAL:
+                order.reserved_qty = 0
+            elif snapshot.status == "PARTIALLY_FILLED":
+                order.reserved_qty = max(0, order.requested_qty - order.filled_qty)
+            db.commit()
+        except RuntimeError as error:
+            # Keep the order open for the next reconciliation attempt; do not
+            # fabricate a broker rejection from a transient connectivity issue.
+            order.reason = str(error)
+            db.commit()
 
 
 def aggregate_account(db: Session, account_id: int):
@@ -234,8 +282,14 @@ def perform_kill(db: Session, account: Account, actor_id: int):
     db.commit()
     account.kill_state = "CANCELLING"
     for order in db.scalars(select(Order).where(Order.account_id == account.id, Order.status.in_(["ACKNOWLEDGED", "PARTIALLY_FILLED", "SUBMITTING", "UNKNOWN"]))).all():
-        order.status = "CANCELLED"
-        order.reserved_qty = 0
+        if settings.is_alpaca_paper and order.broker_order_id:
+            acknowledgement = alpaca_paper_broker.cancel_order(order.broker_order_id)
+            order.status = acknowledgement.status
+            order.reason = acknowledgement.reason
+        else:
+            order.status = "CANCELLED"
+        if order.status == "CANCELLED":
+            order.reserved_qty = 0
     db.commit()
     account.kill_state = "CLOSING"
     db.commit()
