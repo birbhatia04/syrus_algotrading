@@ -1,0 +1,4 @@
+export type Strategy={id:string;name:string;timeframe:string;description:string;rules:string;default_parameters:Record<string,number>}
+export type Subscription={id:number;strategy_id:string;name:string;timeframe:string;symbol:string;status:string;parameters:Record<string,number>;max_daily_loss:number;max_position_size:number;max_orders_per_minute:number}
+export type Order={id:number;subscription_id:number;client_order_id:string;broker_order_id:string|null;symbol:string;side:string;requested_qty:number;filled_qty:number;remaining_qty:number;average_fill_price:number;status:string;reason:string|null;close_only:boolean;created_at:string}
+export type Position={id:number;subscription_id:number;strategy:string;symbol:string;quantity:number;average_price:number;last_price:number;realized_pnl:number;unrealized_pnl:number;charges:number;net_pnl:number}
