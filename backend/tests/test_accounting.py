@@ -70,3 +70,18 @@ def test_halted_account_can_be_explicitly_resumed_when_flat(client, auth):
     account_id = client.get("/api/v1/me", headers=auth).json()["account"]["id"]
     assert client.post(f"/api/v1/accounts/{account_id}/kill-switch", headers=auth).json()["state"] == "HALTED"
     assert client.post(f"/api/v1/accounts/{account_id}/resume", headers=auth).json()["state"] == "RUNNING"
+
+
+def test_profile_completion_is_persisted(client, auth):
+    assert client.get("/api/v1/me", headers=auth).json()["profile_complete"] is False
+    response = client.put("/api/v1/profile", headers=auth, json={
+        "full_name": "Test User",
+        "phone": "+91 98765 43210",
+        "city": "Mumbai",
+        "trading_experience": "BEGINNER",
+        "risk_profile": "BALANCED",
+    })
+    assert response.status_code == 200
+    me = client.get("/api/v1/me", headers=auth).json()
+    assert me["profile_complete"] is True
+    assert me["profile"]["full_name"] == "Test User"

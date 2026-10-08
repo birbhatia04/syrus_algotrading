@@ -13,7 +13,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 from .config import settings
 from .database import Base, SessionLocal, engine, get_db
-from .models import Account, AuditEvent, Candle, Execution, Order, Position, RiskEvent, Session as AuthSession, SimulationEvent, SimulatorSession, Strategy, Subscription, User
+from .models import Account, AuditEvent, Candle, Execution, Order, Position, RiskEvent, Session as AuthSession, SimulationEvent, SimulatorSession, Strategy, Subscription, User, UserProfile
 from .security import create_session, current_user, hash_password, user_account, verify_password
 from .services import aggregate_account, d, evaluate_strategy, ingest_tick, perform_kill, position_values, record_simulation_event, reject_risk, seed_strategies, submit_order
 
@@ -61,6 +61,14 @@ class SimOrderBody(BaseModel):
 
 class DemoBody(BaseModel):
     scenario: str = Field(default="vertical", pattern="^(vertical|full|partial|reject|pending|stale_feed|cancel_race)$")
+
+
+class ProfileBody(BaseModel):
+    full_name: str = Field(min_length=2, max_length=120)
+    phone: str = Field(min_length=7, max_length=30, pattern=r"^[0-9+() -]+$")
+    city: str = Field(min_length=2, max_length=100)
+    trading_experience: str = Field(pattern=r"^(BEGINNER|INTERMEDIATE|ADVANCED)$")
+    risk_profile: str = Field(pattern=r"^(CONSERVATIVE|BALANCED|AGGRESSIVE)$")
 
 
 def iso(value):
@@ -126,7 +134,26 @@ def logout(user: User = Depends(current_user), db: Session = Depends(get_db)):
 @app.get("/api/v1/me")
 def me(user: User = Depends(current_user), db: Session = Depends(get_db)):
     account = user_account(user, db)
-    return {"id": user.id, "email": user.email, "role": user.role, "account": {"id": account.id, "name": account.name, "status": account.status, "kill_state": account.kill_state}}
+    profile = db.scalar(select(UserProfile).where(UserProfile.user_id == user.id))
+    return {"id": user.id, "email": user.email, "role": user.role, "profile_complete": profile is not None, "profile": profile_json(profile) if profile else None, "account": {"id": account.id, "name": account.name, "status": account.status, "kill_state": account.kill_state}}
+
+
+def profile_json(profile: UserProfile):
+    return {"full_name": profile.full_name, "phone": profile.phone, "city": profile.city, "trading_experience": profile.trading_experience, "risk_profile": profile.risk_profile}
+
+
+@app.put("/api/v1/profile")
+def save_profile(body: ProfileBody, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    profile = db.scalar(select(UserProfile).where(UserProfile.user_id == user.id))
+    if not profile:
+        profile = UserProfile(user_id=user.id, **body.model_dump())
+        db.add(profile)
+    else:
+        for field, value in body.model_dump().items():
+            setattr(profile, field, value)
+    db.commit()
+    db.refresh(profile)
+    return profile_json(profile)
 
 
 @app.get("/api/v1/strategies")

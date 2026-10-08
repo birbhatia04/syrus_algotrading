@@ -20,6 +20,19 @@ class User(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class UserProfile(Base):
+    __tablename__ = "user_profiles"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), unique=True, index=True)
+    full_name: Mapped[str] = mapped_column(String(120))
+    phone: Mapped[str] = mapped_column(String(30))
+    city: Mapped[str] = mapped_column(String(100))
+    trading_experience: Mapped[str] = mapped_column(String(30))
+    risk_profile: Mapped[str] = mapped_column(String(30))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
 class Account(Base):
     __tablename__ = "accounts"
     id: Mapped[int] = mapped_column(primary_key=True)

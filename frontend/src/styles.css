@@ -64,8 +64,9 @@ td small{color:#7b877e}.mono{color:#4f5f55}
 .tabs button{color:#738078}.tabs button.active{color:#152019;border-color:#4a8c5f}.tabs b{background:#e3e9e1;color:#536158}
 .riskrow{border-color:#dfe5dd}.riskrow small{color:#748078}
 .riskrow label,.authform label{color:#637168}
-.riskrow input,.authform input{background:#fff;border-color:#cad4c8;color:#17221b;box-shadow:inset 0 1px 1px #1a2b1e08}
-.riskrow input:focus,.authform input:focus{border-color:#4e9363;box-shadow:0 0 0 3px #4e93631f}
+.riskrow input,.authform input,.authform select{background:#fff;border-color:#cad4c8;color:#17221b;box-shadow:inset 0 1px 1px #1a2b1e08}
+.authform select{display:block;width:100%;margin-top:7px;border:1px solid #cad4c8;border-radius:6px;padding:12px;outline:none}
+.riskrow input:focus,.authform input:focus,.authform select:focus{border-color:#4e9363;box-shadow:0 0 0 3px #4e93631f}
 .event{border-color:#dfe5dd;color:#a2474b}.event p{color:#55635a}.event small{color:#7c8880}
 .auth{background:#f3f5f0}
 .auth>section:first-child{background:radial-gradient(circle at 12% 88%,#dceadc 0,transparent 38%),#f3f5f0}
