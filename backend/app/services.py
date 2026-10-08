@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional, Tuple
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from .brokers import alpaca_paper_broker, simulator_broker
@@ -237,7 +237,10 @@ def reconcile_alpaca_orders(db: Session, account: Account):
     orders = db.scalars(select(Order).where(
         Order.account_id == account.id,
         Order.broker_order_id.is_not(None),
-        Order.status.not_in(TERMINAL),
+        or_(
+            Order.status.not_in(TERMINAL),
+            (Order.status == "FILLED") & (Order.filled_qty < Order.requested_qty),
+        ),
     )).all()
     for order in orders:
         try:
@@ -246,6 +249,20 @@ def reconcile_alpaca_orders(db: Session, account: Account):
                 # Alpaca reports commission-free paper fills. Broker fees are not invented.
                 apply_fill(db, order, fill.execution_id, fill.quantity, fill.price, Decimal("0"))
             db.refresh(order)
+            if snapshot.filled_qty > order.filled_qty:
+                # Activities are the preferred exact execution source. Alpaca's
+                # order snapshot is a safe fallback if the activity feed lags.
+                fallback_qty = snapshot.filled_qty - order.filled_qty
+                fallback_price = snapshot.average_fill_price or d(order.average_fill_price)
+                apply_fill(
+                    db,
+                    order,
+                    f"{order.broker_order_id}-snapshot-{snapshot.filled_qty}",
+                    fallback_qty,
+                    fallback_price,
+                    Decimal("0"),
+                )
+                db.refresh(order)
             order.status = snapshot.status
             order.reason = snapshot.reason
             if snapshot.status in TERMINAL:
