@@ -1,5 +1,8 @@
 import os
 os.environ["DATABASE_URL"] = "sqlite:///./test_aegis.db"
+# Tests cover deterministic simulator behaviour and must never inherit the
+# developer's local paper-trading selection or credentials.
+os.environ["ENVIRONMENT"] = "SIMULATOR"
 
 import pytest
 from fastapi.testclient import TestClient

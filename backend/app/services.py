@@ -282,7 +282,9 @@ def perform_kill(db: Session, account: Account, actor_id: int):
     db.commit()
     account.kill_state = "CANCELLING"
     for order in db.scalars(select(Order).where(Order.account_id == account.id, Order.status.in_(["ACKNOWLEDGED", "PARTIALLY_FILLED", "SUBMITTING", "UNKNOWN"]))).all():
-        if settings.is_alpaca_paper and order.broker_order_id:
+        # Historical simulator orders have SIM-* identifiers and never existed
+        # at Alpaca. Cancel those locally when a workspace migrates to Paper.
+        if settings.is_alpaca_paper and order.broker_order_id and not order.broker_order_id.startswith("SIM-"):
             acknowledgement = alpaca_paper_broker.cancel_order(order.broker_order_id)
             order.status = acknowledgement.status
             order.reason = acknowledgement.reason
@@ -295,6 +297,14 @@ def perform_kill(db: Session, account: Account, actor_id: int):
     db.commit()
     for position in db.scalars(select(Position).where(Position.account_id == account.id, Position.quantity != 0)).all():
         sub = db.get(Subscription, position.subscription_id)
+        if settings.is_alpaca_paper and position.symbol == "RELIANCE":
+            # RELIANCE only existed in the retired deterministic simulator. It
+            # must be removed from the local ledger, never submitted to Alpaca.
+            position.quantity = 0
+            position.average_price = d(0)
+            record_simulation_event(db, account.id, "MIGRATION", "Retired simulator RELIANCE position", "No Alpaca order was sent")
+            db.commit()
+            continue
         side = "SELL" if position.quantity > 0 else "BUY"
         submit_order(db, account, sub, side, abs(position.quantity), position.last_price, client_id=f"kill-{account.id}-{position.id}", close_only=True)
     remaining = db.scalar(select(func.count(Position.id)).where(Position.account_id == account.id, Position.quantity != 0)) or 0
