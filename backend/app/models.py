@@ -2,7 +2,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Optional
-from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, Numeric, String, Text, UniqueConstraint
+from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Index, Integer, Numeric, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 from .database import Base
 
@@ -180,3 +180,66 @@ class SimulatorSession(Base):
     last_price: Mapped[Decimal] = mapped_column(Numeric(18, 4), default=Decimal("2500"))
     tick_index: Mapped[int] = mapped_column(Integer, default=0)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class Instrument(Base):
+    """This release trades NSE cash only; token mappings come from the daily CSV."""
+    __tablename__ = "broker_instruments"
+    symbol: Mapped[str] = mapped_column(String(20), primary_key=True)
+    token: Mapped[int] = mapped_column(Integer, unique=True)
+    ticksize: Mapped[int] = mapped_column(Integer)
+    lot_size: Mapped[int] = mapped_column(Integer, default=1)
+    freeze_quantity: Mapped[int] = mapped_column(Integer)
+    lower_circuit: Mapped[int] = mapped_column(Integer)
+    upper_circuit: Mapped[int] = mapped_column(Integer)
+    trading_day: Mapped[str] = mapped_column(String(10))
+
+
+class MarketQuote(Base):
+    __tablename__ = "market_quotes"
+    symbol: Mapped[str] = mapped_column(String(20), primary_key=True)
+    price: Mapped[Decimal] = mapped_column(Numeric(18, 4))
+    day_open: Mapped[Decimal] = mapped_column(Numeric(18, 4), default=Decimal("0"))
+    cumulative_volume: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    market_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class BrokerState(Base):
+    __tablename__ = "broker_states"
+    account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id"), primary_key=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    market_connected: Mapped[bool] = mapped_column(Boolean, default=False)
+    orders_connected: Mapped[bool] = mapped_column(Boolean, default=False)
+    last_reconciled_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[str] = mapped_column(Text, default="")
+    broker_positions: Mapped[str] = mapped_column(Text, default="[]")
+    kill_started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    kill_elapsed_ms: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
+
+class OrderRoute(Base):
+    __tablename__ = "order_routes"
+    order_id: Mapped[int] = mapped_column(ForeignKey("orders.id"), primary_key=True)
+    token: Mapped[int] = mapped_column(Integer)
+    exchange: Mapped[str] = mapped_column(String(10), default="NSE")
+    price_paise: Mapped[int] = mapped_column(Integer, default=0)
+    broker_reference: Mapped[Optional[str]] = mapped_column(String(120), unique=True, nullable=True)
+    # Snapshot taken immediately before POST; helps a human resolve an ambiguous POST.
+    known_order_ids: Mapped[str] = mapped_column(Text, default="[]")
+    last_cancel_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class StrategyDay(Base):
+    __tablename__ = "strategy_days"
+    __table_args__ = (UniqueConstraint("subscription_id", "trading_day"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    subscription_id: Mapped[int] = mapped_column(ForeignKey("subscriptions.id"))
+    trading_day: Mapped[str] = mapped_column(String(10))
+    realized_pnl: Mapped[Decimal] = mapped_column(Numeric(18, 4), default=Decimal("0"))
+    charges: Mapped[Decimal] = mapped_column(Numeric(18, 4), default=Decimal("0"))
+    loss_latched: Mapped[bool] = mapped_column(Boolean, default=False)
+    entry_attempted: Mapped[bool] = mapped_column(Boolean, default=False)
+    exiting: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Last evaluated closed candle, persisted separately from order submission.
+    signal_key: Mapped[str] = mapped_column(String(100), default="")

@@ -16,6 +16,10 @@ from .database import Base, SessionLocal, engine, get_db
 from .models import Account, AuditEvent, Candle, Execution, Order, Position, RiskEvent, Session as AuthSession, SimulationEvent, SimulatorSession, Strategy, Subscription, User, UserProfile
 from .security import create_session, current_user, hash_password, user_account, verify_password
 from .services import aggregate_account, d, evaluate_strategy, ingest_tick, perform_kill, position_values, record_simulation_event, reject_risk, seed_strategies, submit_order
+from .models import BrokerState, Instrument, MarketQuote
+from .broker_api import router as broker_router, bound_account, request_kill
+from .engine_021 import lock_account
+from .trading_rules import SUPPORTED, OPEN_STATES, daily_net, sub_position, utc, day_string
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
@@ -24,13 +28,14 @@ async def lifespan(_app: FastAPI):
         seed_strategies(db)
         # Recovery gate: durable state is loaded and pending exposure remains reserved.
         for account in db.scalars(select(Account)).all():
-            account.recovered = account.kill_state in {"RUNNING", "HALTED"}
-            account.worker_heartbeat = datetime.now(timezone.utc)
+            if not settings.is_021:
+                account.recovered = account.kill_state in {"RUNNING", "HALTED"}
         db.commit()
     yield
 
 
 app = FastAPI(title=settings.app_name, version="1.0.0", lifespan=lifespan)
+app.include_router(broker_router)
 app.add_middleware(CORSMiddleware, allow_origins=settings.origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 
@@ -48,6 +53,11 @@ class RiskBody(BaseModel):
     max_daily_loss: Decimal = Field(gt=0, le=1000000)
     max_position_size: int = Field(gt=0, le=100000)
     max_orders_per_minute: int = Field(gt=0, le=1000)
+
+
+class ParametersBody(BaseModel):
+    quantity: int = Field(gt=0, le=100000)
+    side: str = Field(default="BUY", pattern="^(BUY|SELL)$")
 
 
 class SimOrderBody(BaseModel):
@@ -87,7 +97,10 @@ def num(value):
 
 def sub_json(db, sub):
     strategy = db.get(Strategy, sub.strategy_id)
-    return {"id": sub.id, "strategy_id": sub.strategy_id, "name": strategy.name, "timeframe": strategy.timeframe, "symbol": sub.symbol, "status": sub.status, "parameters": json.loads(sub.parameters), "max_daily_loss": num(sub.max_daily_loss), "max_position_size": sub.max_position_size, "max_orders_per_minute": sub.max_orders_per_minute}
+    position = sub_position(db, sub)
+    net = position_values(position)[1] if position else d(0)
+    today = daily_net(db, sub, datetime.now(timezone.utc))
+    return {"id": sub.id, "strategy_id": sub.strategy_id, "name": strategy.name, "timeframe": strategy.timeframe, "symbol": sub.symbol, "status": sub.status, "parameters": json.loads(sub.parameters), "max_daily_loss": num(sub.max_daily_loss), "max_position_size": sub.max_position_size, "max_orders_per_minute": sub.max_orders_per_minute, "quantity": position.quantity if position else 0, "net_pnl": num(net), "daily_net_pnl": num(today)}
 
 
 def order_json(order):
@@ -102,7 +115,7 @@ def live():
 @app.get("/api/v1/health/ready")
 def ready(db: Session = Depends(get_db)):
     db.scalar(select(func.count(User.id)))
-    return {"status": "ready", "broker": settings.environment, "execution": "reconciled"}
+    return {"status": "ready", "broker": settings.environment}
 
 
 @app.post("/api/v1/auth/register", status_code=201)
@@ -112,7 +125,7 @@ def register(body: Credentials, db: Session = Depends(get_db)):
         raise HTTPException(409, "Email already registered")
     user = User(email=email, password_hash=hash_password(body.password))
     db.add(user); db.flush()
-    account = Account(user_id=user.id)
+    account = Account(user_id=user.id, name="021 sandbox" if settings.is_021 else "Primary simulator", recovered=not settings.is_021)
     db.add(account); db.commit()
     return {"token": create_session(db, user.id), "user": {"id": user.id, "email": user.email, "role": user.role}, "account_id": account.id}
 
@@ -158,7 +171,7 @@ def save_profile(body: ProfileBody, user: User = Depends(current_user), db: Sess
 
 @app.get("/api/v1/strategies")
 def strategies(user: User = Depends(current_user), db: Session = Depends(get_db)):
-    return [{"id": s.id, "name": s.name, "timeframe": s.timeframe, "description": s.description, "rules": s.rules, "default_parameters": json.loads(s.default_parameters)} for s in db.scalars(select(Strategy)).all()]
+    return [{"id": s.id, "name": s.name, "timeframe": s.timeframe, "description": s.description, "rules": s.rules, "default_parameters": json.loads(s.default_parameters)} for s in db.scalars(select(Strategy)).all() if not settings.is_021 or s.id in SUPPORTED]
 
 
 @app.get("/api/v1/subscriptions")
@@ -172,7 +185,14 @@ def subscribe(body: SubscribeBody, user: User = Depends(current_user), db: Sessi
     account = user_account(user, db)
     strategy = db.get(Strategy, body.strategy_id)
     if not strategy: raise HTTPException(404, "Strategy not found")
-    symbol = body.symbol or settings.upstox_default_symbol
+    symbol = body.symbol or "RELIANCE"
+    if settings.is_021:
+        bound_account(user, db)
+        if body.strategy_id not in SUPPORTED:
+            raise HTTPException(409, "Choose one of the three 021 strategies")
+        instrument = db.get(Instrument, symbol)
+        if not instrument or instrument.trading_day != day_string(datetime.now(timezone.utc)):
+            raise HTTPException(409, "Symbol unavailable in today's NSE instrument master; start the worker first")
     existing = db.scalar(select(Subscription).where(Subscription.account_id == account.id, Subscription.strategy_id == body.strategy_id))
     if existing:
         if existing.symbol != symbol:
@@ -196,8 +216,17 @@ def owned_sub(db, account_id, sub_id):
 
 @app.post("/api/v1/subscriptions/{sub_id}/{action}")
 def control_subscription(sub_id: int, action: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
-    account = user_account(user, db); sub = owned_sub(db, account.id, sub_id)
+    account = user_account(user, db)
+    if settings.is_021:
+        account = lock_account(db, account.id)
+    sub = owned_sub(db, account.id, sub_id)
     if action not in {"start", "pause"}: raise HTTPException(404, "Unknown action")
+    if settings.is_021:
+        bound_account(user, db)
+        if sub.strategy_id not in SUPPORTED:
+            raise HTTPException(409, "Legacy simulator strategy cannot run against 021")
+        if action == "start" and (not account.recovered or (datetime.now(timezone.utc) - utc(account.worker_heartbeat)).total_seconds() > 5):
+            raise HTTPException(409, "Wait for the worker to reconcile the 021 account")
     if action == "start" and account.kill_state != "RUNNING": raise HTTPException(409, "Reset kill switch before starting")
     sub.status = "RUNNING" if action == "start" else "PAUSED"; db.commit()
     return sub_json(db, sub)
@@ -205,9 +234,34 @@ def control_subscription(sub_id: int, action: str, user: User = Depends(current_
 
 @app.patch("/api/v1/subscriptions/{sub_id}/risk-limits")
 def update_risk(sub_id: int, body: RiskBody, user: User = Depends(current_user), db: Session = Depends(get_db)):
-    account = user_account(user, db); sub = owned_sub(db, account.id, sub_id)
+    account = user_account(user, db)
+    if settings.is_021:
+        account = lock_account(db, account.id)
+    sub = owned_sub(db, account.id, sub_id)
     sub.max_daily_loss, sub.max_position_size, sub.max_orders_per_minute = body.max_daily_loss, body.max_position_size, body.max_orders_per_minute
     db.add(AuditEvent(account_id=account.id, actor_user_id=user.id, action="RISK_LIMITS_UPDATED", detail=f"subscription={sub.id}")); db.commit()
+    return sub_json(db, sub)
+
+
+@app.patch("/api/v1/subscriptions/{sub_id}/parameters")
+def parameters(sub_id: int, body: ParametersBody, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    account = user_account(user, db)
+    sub = owned_sub(db, account.id, sub_id)
+    position = sub_position(db, sub)
+    pending = db.scalar(select(Order.id).where(Order.subscription_id == sub.id, Order.status.in_(OPEN_STATES)))
+    if sub.status == "RUNNING" or (position and position.quantity) or pending:
+        raise HTTPException(409, "Pause and flatten the strategy before changing its parameters")
+    if settings.is_021:
+        bound_account(user, db)
+        instrument = db.get(Instrument, sub.symbol)
+        if not instrument or body.quantity % instrument.lot_size or body.quantity > instrument.freeze_quantity:
+            raise HTTPException(422, "Quantity violates the instrument lot or freeze limit")
+    values = json.loads(sub.parameters)
+    values["quantity"] = body.quantity
+    if sub.strategy_id == "time_entry":
+        values["side"] = body.side
+    sub.parameters = json.dumps(values)
+    db.commit()
     return sub_json(db, sub)
 
 
@@ -217,7 +271,9 @@ def dashboard(user: User = Depends(current_user), db: Session = Depends(get_db))
     orders = db.scalars(select(Order).where(Order.account_id == account.id).order_by(Order.created_at.desc()).limit(6)).all()
     subs = db.scalars(select(Subscription).where(Subscription.account_id == account.id)).all()
     session = db.get(SimulatorSession, account.id)
-    return {"environment": settings.environment, "currency": settings.currency, "default_symbol": settings.upstox_default_symbol if settings.is_upstox_sandbox else "RELIANCE", "feed_active": bool(session and session.active), "account": {"id": account.id, "name": account.name, "kill_state": account.kill_state, "recovered": account.recovered, "worker_heartbeat": iso(account.worker_heartbeat)}, "pnl": {k: num(v) for k, v in totals.items() if k != "positions"}, "aggregate_positions": totals["positions"], "running_strategies": sum(1 for s in subs if s.status == "RUNNING"), "subscriptions": len(subs), "recent_orders": [order_json(o) for o in orders]}
+    broker_state = db.get(BrokerState, account.id)
+    active = bool(broker_state and broker_state.enabled) if settings.is_021 else bool(session and session.active)
+    return {"environment": settings.environment, "currency": settings.currency, "default_symbol": settings.broker_021_default_symbol if settings.is_021 else "RELIANCE", "feed_active": active, "charges_assumed": True, "charge_rate": num(settings.assumed_charge_rate), "account": {"id": account.id, "name": account.name, "kill_state": account.kill_state, "recovered": account.recovered and (not settings.is_021 or (datetime.now(timezone.utc) - utc(account.worker_heartbeat)).total_seconds() < 5), "worker_heartbeat": iso(account.worker_heartbeat)}, "pnl": {k: num(v) for k, v in totals.items() if k != "positions"}, "aggregate_positions": totals["positions"], "running_strategies": sum(1 for s in subs if s.status == "RUNNING"), "subscriptions": len(subs), "recent_orders": [order_json(o) for o in orders]}
 
 
 @app.get("/api/v1/orders")
@@ -249,7 +305,7 @@ def risk_events(user: User = Depends(current_user), db: Session = Depends(get_db
 
 @app.get("/api/v1/candles")
 def candles(symbol: Optional[str] = None, timeframe: str = "1m", user: User = Depends(current_user), db: Session = Depends(get_db)):
-    symbol = symbol or settings.upstox_default_symbol
+    symbol = symbol or "RELIANCE"
     rows = db.scalars(select(Candle).where(Candle.symbol == symbol, Candle.timeframe == timeframe).order_by(Candle.bucket_start.desc()).limit(100)).all()
     return [{"time": iso(c.bucket_start), "open": num(c.open), "high": num(c.high), "low": num(c.low), "close": num(c.close), "volume": c.volume, "closed": c.closed} for c in reversed(rows)]
 
@@ -275,26 +331,30 @@ def market_feed(user: User = Depends(current_user), db: Session = Depends(get_db
         latest = current or closed
         latest_price = num(latest.close) if latest else None
         latest_at = latest.bucket_start if latest else None
-        quote_source = "Upstox live market-data feed" if settings.is_upstox_sandbox else "Stored strategy candle"
-        is_stale = bool(latest_at and datetime.now(timezone.utc) - latest_at > timedelta(minutes=2))
+        quote_source = "Stored simulator candle"
+        if settings.is_021:
+            quote = db.get(MarketQuote, symbol)
+            latest_price, latest_at = (num(quote.price), quote.market_at) if quote else (None, None)
+            quote_source = "021 sampled live market updates"
+        is_stale = bool(latest_at and datetime.now(timezone.utc) - utc(latest_at) > timedelta(seconds=settings.market_stale_seconds if settings.is_021 else 120))
         items.append({"symbol": symbol, "latest_price": latest_price, "latest_at": iso(latest_at), "stale": is_stale, "quote_source": quote_source, "current_candle": candle_json(current), "last_closed_candle": candle_json(closed)})
     return {
-        "provider": "Upstox Market Data Feed V3" if settings.is_upstox_sandbox else "Deterministic simulator",
-        "active": bool(session and session.active),
+        "provider": "021 NSE live feed" if settings.is_021 else "Deterministic simulator",
+        "active": bool(db.get(BrokerState, account.id) and db.get(BrokerState, account.id).market_connected and (datetime.now(timezone.utc) - utc(account.worker_heartbeat)).total_seconds() < 5) if settings.is_021 else bool(session and session.active),
         "symbols": items,
     }
 
 
 @app.post("/api/v1/simulator/orders")
 def simulator_order(body: SimOrderBody, user: User = Depends(current_user), db: Session = Depends(get_db)):
-    if settings.environment != "SIMULATOR": raise HTTPException(404, "Simulator controls unavailable")
+    if settings.is_021: raise HTTPException(409, "Simulator orders are disabled in 021 mode")
     account = user_account(user, db); sub = owned_sub(db, account.id, body.subscription_id)
     return order_json(submit_order(db, account, sub, body.side, body.quantity, body.price, body.scenario, body.client_order_id))
 
 
 @app.post("/api/v1/simulator/demo")
 def simulator_demo(body: DemoBody = DemoBody(), user: User = Depends(current_user), db: Session = Depends(get_db)):
-    if settings.environment != "SIMULATOR": raise HTTPException(404, "Simulator controls unavailable")
+    if settings.is_021: raise HTTPException(409, "Simulator demo is disabled in 021 mode")
     account = user_account(user, db); subs = db.scalars(select(Subscription).where(Subscription.account_id == account.id)).all()
     run_id = f"run-{uuid.uuid4().hex[:10]}"
     if body.scenario != "vertical":
@@ -335,16 +395,15 @@ def simulator_events(user: User = Depends(current_user), db: Session = Depends(g
 
 @app.post("/api/v1/simulator/stream/{action}")
 def simulator_stream(action: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    if settings.is_021: raise HTTPException(409, "Use /broker/stream in 021 mode")
     if action not in {"start", "stop"}: raise HTTPException(404, "Unknown stream action")
-    if settings.is_upstox_sandbox and not settings.upstox_configured:
-        raise HTTPException(409, "Upstox Analytics and Sandbox tokens are not configured on the backend")
     account = user_account(user, db)
     session = db.get(SimulatorSession, account.id) or SimulatorSession(account_id=account.id)
     session.active = action == "start"
     if session.active and not session.virtual_time:
         session.virtual_time = datetime.now(timezone.utc).replace(second=0, microsecond=0)
-    label = "Upstox market feed" if settings.is_upstox_sandbox else "Virtual market stream"
-    detail = "Upstox V3 live ticks feed closed-candle strategies; orders go only to Sandbox" if settings.is_upstox_sandbox else "One simulated minute advances every two seconds"
+    label = "Virtual market stream"
+    detail = "One simulated minute advances every two seconds"
     db.add(session); record_simulation_event(db, account.id, "STREAM", f"{label} {action}ed", detail)
     db.commit()
     return {"active": session.active, "virtual_time": iso(session.virtual_time)}
@@ -354,6 +413,10 @@ def simulator_stream(action: str, user: User = Depends(current_user), db: Sessio
 def kill(account_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
     account = user_account(user, db)
     if account.id != account_id: raise HTTPException(403, "Account access denied")
+    if settings.is_021:
+        bound_account(user, db)
+        request_kill(db, account, user.id)
+        return {"state": account.kill_state, "elapsed_ms": 0}
     started = datetime.now(timezone.utc); perform_kill(db, account, user.id)
     return {"state": account.kill_state, "elapsed_ms": int((datetime.now(timezone.utc)-started).total_seconds()*1000)}
 
@@ -363,8 +426,12 @@ def resume(account_id: int, user: User = Depends(current_user), db: Session = De
     account = user_account(user, db)
     if account.id != account_id: raise HTTPException(403, "Account access denied")
     remaining = db.scalar(select(func.count(Position.id)).where(Position.account_id == account.id, Position.quantity != 0)) or 0
-    unknown = db.scalar(select(func.count(Order.id)).where(Order.account_id == account.id, Order.status == "UNKNOWN")) or 0
+    unknown = db.scalar(select(func.count(Order.id)).where(Order.account_id == account.id, Order.status.in_(OPEN_STATES))) or 0
     if remaining or unknown: raise HTTPException(409, "Reconciliation is not flat and resolved")
+    if settings.is_021:
+        bound_account(user, db)
+        if not account.recovered or account.kill_state != "HALTED" or (datetime.now(timezone.utc) - utc(account.worker_heartbeat)).total_seconds() > 5:
+            raise HTTPException(409, "Worker must confirm a flat reconciled account before resuming")
     account.kill_state = "RUNNING"; account.recovered = True; db.add(AuditEvent(account_id=account.id, actor_user_id=user.id, action="KILL_RESET", detail="Explicit reset after reconciliation")); db.commit()
     return {"state": account.kill_state}
 

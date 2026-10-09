@@ -5,7 +5,7 @@ services:
       POSTGRES_USER: aegis
       POSTGRES_PASSWORD: aegis_local_only
       POSTGRES_DB: aegis
-    volumes: [aegis-db:/var/lib/postgresql/data]
+    volumes: [algorhythm-021-db:/var/lib/postgresql/data]
     healthcheck: {test: ["CMD-SHELL", "pg_isready -U aegis"], interval: 3s, timeout: 3s, retries: 10}
   redis:
     image: redis:7-alpine
@@ -15,7 +15,6 @@ services:
     command: alembic upgrade head
     environment:
       DATABASE_URL: postgresql+psycopg://aegis:aegis_local_only@db:5432/aegis
-      ENVIRONMENT: ${ENVIRONMENT:-SIMULATOR}
     depends_on:
       db:
         condition: service_healthy
@@ -23,11 +22,11 @@ services:
     build: ./backend
     environment:
       DATABASE_URL: postgresql+psycopg://aegis:aegis_local_only@db:5432/aegis
-      ENVIRONMENT: ${ENVIRONMENT:-SIMULATOR}
-      UPSTOX_ANALYTICS_TOKEN: ${UPSTOX_ANALYTICS_TOKEN:-}
-      UPSTOX_SANDBOX_ACCESS_TOKEN: ${UPSTOX_SANDBOX_ACCESS_TOKEN:-}
-      UPSTOX_DEFAULT_SYMBOL: ${UPSTOX_DEFAULT_SYMBOL:-INFY}
-      UPSTOX_DEFAULT_INSTRUMENT_KEY: ${UPSTOX_DEFAULT_INSTRUMENT_KEY:-NSE_EQ|INE009A01021}
+      ENVIRONMENT: ${ENVIRONMENT:-021_SANDBOX}
+      BROKER_021_ACCESS_TOKEN: ${BROKER_021_ACCESS_TOKEN:-}
+      BROKER_021_ACCOUNT_ID: ${BROKER_021_ACCOUNT_ID:-1}
+      BROKER_021_DEFAULT_SYMBOL: ${BROKER_021_DEFAULT_SYMBOL:-RELIANCE}
+      ASSUMED_CHARGE_RATE: ${ASSUMED_CHARGE_RATE:-0.0005}
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -37,11 +36,11 @@ services:
     command: python -m app.worker
     environment:
       DATABASE_URL: postgresql+psycopg://aegis:aegis_local_only@db:5432/aegis
-      ENVIRONMENT: ${ENVIRONMENT:-SIMULATOR}
-      UPSTOX_ANALYTICS_TOKEN: ${UPSTOX_ANALYTICS_TOKEN:-}
-      UPSTOX_SANDBOX_ACCESS_TOKEN: ${UPSTOX_SANDBOX_ACCESS_TOKEN:-}
-      UPSTOX_DEFAULT_SYMBOL: ${UPSTOX_DEFAULT_SYMBOL:-INFY}
-      UPSTOX_DEFAULT_INSTRUMENT_KEY: ${UPSTOX_DEFAULT_INSTRUMENT_KEY:-NSE_EQ|INE009A01021}
+      ENVIRONMENT: ${ENVIRONMENT:-021_SANDBOX}
+      BROKER_021_ACCESS_TOKEN: ${BROKER_021_ACCESS_TOKEN:-}
+      BROKER_021_ACCOUNT_ID: ${BROKER_021_ACCOUNT_ID:-1}
+      BROKER_021_DEFAULT_SYMBOL: ${BROKER_021_DEFAULT_SYMBOL:-RELIANCE}
+      ASSUMED_CHARGE_RATE: ${ASSUMED_CHARGE_RATE:-0.0005}
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -50,4 +49,4 @@ services:
     depends_on: [api]
     ports: ["5173:80"]
 volumes:
-  aegis-db:
+  algorhythm-021-db:

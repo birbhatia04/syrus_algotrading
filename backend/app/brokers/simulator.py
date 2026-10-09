@@ -5,7 +5,7 @@ from .contracts import BrokerAcknowledgement, BrokerExecution, BrokerOrderReques
 
 
 class DeterministicSimulatorBroker:
-    """Deterministic normalized broker used only when ENVIRONMENT=SIMULATOR."""
+    """Deterministic normalized broker for the simulator-only application."""
     def __init__(self):
         self._orders: Dict[str, BrokerAcknowledgement] = {}
 

@@ -7,10 +7,10 @@ from typing import Optional, Tuple
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
-from .brokers import simulator_broker, upstox_sandbox_broker
+from .brokers import simulator_broker
 from .brokers.contracts import BrokerOrderRequest
 from .config import settings
-from .models import Account, AuditEvent, Candle, Execution, Order, Position, RiskEvent, SimulationEvent, Strategy, Subscription
+from .models import Account, AuditEvent, Candle, Execution, Order, Position, RiskEvent, SimulationEvent, Strategy, Subscription, StrategyDay
 
 MONEY = Decimal("0.0001")
 TERMINAL = {"FILLED", "CANCELLED", "REJECTED", "RISK_REJECTED"}
@@ -30,9 +30,33 @@ def seed_strategies(db: Session):
         ("rsi_revert", "RSI mean reversion", "1m", "Trades measured short-term overextension using closed candles.", "On closed 1-minute candles, buy when RSI(6) falls below 35 and sell when it rises above 65. Warm-up: 7 closed candles. Order size: 8. One signal per candle.", {"period": 6, "lower": 35, "upper": 65, "quantity": 8}),
         ("breakout_5m", "Five-minute breakout", "5m", "Acts only when a completed five-minute close escapes its preceding range.", "Buy when a closed 5-minute candle closes above the prior 3-candle high; sell below the prior 3-candle low. Warm-up: 4 closed candles. Order size: 12. One signal per candle.", {"lookback": 3, "quantity": 12}),
     ]
+    if settings.is_021:
+        definitions[0] = (
+            "ma_cross", "Recurring candle momentum", "1m + 5m",
+            "A repeatable intraday strategy driven by platform-built candles.",
+            "On each newly closed 1-minute candle while flat, combine its percentage body with the latest 5-minute candle's percentage body. Buy when the combined bias is non-negative; sell when it is negative. Exit on an opposite 1-minute candle, after 1 minute from the latest fill, or at 15:15 IST. Re-entry is allowed on a later closed candle after the exit is confirmed, up to 6 entry cycles per day; no pyramiding.",
+            {"hold_minutes": 1, "max_cycles": 6, "quantity": 1},
+        )
+        definitions.extend([
+            ("time_entry", "09:15 entry / 15:15 exit", "clock", "One intraday entry, followed by a scheduled square-off.",
+             "Enter BUY 1 NSE share on the first fresh quote in 09:15–09:16 IST. Skip a missed window. At 15:15 cancel outstanding entries, reconcile, then close the attributed position. One entry attempt per day.", {"quantity": 1, "side": "BUY"}),
+            ("open_breakout", "1% open breakout", "tick", "Buy above the day open +1%, sell below the day open −1%.",
+             "Enter 1 share at ±1% from today's exchange open. From the actual weighted entry fill, exit at a tick-rounded 5% target or 5% stop. Cancel entry remainder before closing; one entry attempt per day; force exit at 15:15 IST.", {"quantity": 1}),
+        ])
     for sid, name, timeframe, description, rules, params in definitions:
         if not db.get(Strategy, sid):
             db.add(Strategy(id=sid, name=name, timeframe=timeframe, description=description, rules=rules, default_parameters=json.dumps(params)))
+        elif settings.is_021 and sid in {"ma_cross", "time_entry", "open_breakout"}:
+            strategy = db.get(Strategy, sid)
+            strategy.name, strategy.timeframe, strategy.description, strategy.rules = name, timeframe, description, rules
+            strategy.default_parameters = json.dumps(params)
+    if settings.is_021:
+        # Existing installations keep subscriptions across deploys. Move the
+        # candle strategy to repeatable demo parameters while preserving size.
+        for sub in db.scalars(select(Subscription).where(Subscription.strategy_id == "ma_cross")).all():
+            current = json.loads(sub.parameters)
+            if "max_cycles" not in current or "fast" in current or "slow" in current:
+                sub.parameters = json.dumps({"hold_minutes": 1, "max_cycles": 6, "quantity": int(current.get("quantity", 1))})
     db.commit()
 
 
@@ -81,7 +105,7 @@ def evaluate_strategy(db: Session, subscription: Subscription) -> Optional[Tuple
     return None
 
 
-def ingest_tick(db: Session, symbol: str, price: Decimal, ts: datetime, quantity: Optional[int] = None):
+def ingest_tick(db: Session, symbol: str, price: Decimal, ts: datetime, quantity: Optional[int] = None, *, commit: bool = True):
     """UTC aligned incremental OHLC. A later bucket closes earlier open candles; late ticks never revise closed candles."""
     price = d(price)
     output = []
@@ -101,7 +125,8 @@ def ingest_tick(db: Session, symbol: str, price: Decimal, ts: datetime, quantity
             db.add(candle)
         if candle:
             output.append(candle)
-    db.commit()
+    if commit:
+        db.commit()
     return output
 
 
@@ -111,15 +136,17 @@ def position_values(position: Position):
     return unrealized, net
 
 
-def apply_fill(db: Session, order: Order, execution_id: str, qty: int, price: Decimal, charge_rate: Decimal = Decimal("0.0005")) -> bool:
+def apply_fill(db: Session, order: Order, execution_id: str, qty: int, price: Decimal, charge_rate: Decimal | None = None, executed_at: datetime | None = None) -> bool:
     """Apply one incremental execution atomically. Unique execution IDs make replay a no-op."""
-    if qty <= 0 or order.filled_qty + qty > order.requested_qty:
-        raise ValueError("Invalid incremental execution quantity")
     if db.scalar(select(Execution).where(Execution.account_id == order.account_id, Execution.execution_id == execution_id)):
         return False
+    if qty <= 0 or order.filled_qty + qty > order.requested_qty:
+        raise ValueError("Invalid incremental execution quantity")
+    charge_rate = settings.assumed_charge_rate if charge_rate is None else charge_rate
+    executed_at = executed_at or datetime.now(timezone.utc)
     price = d(price)
     charge = d(price * qty * charge_rate)
-    execution = Execution(account_id=order.account_id, order_id=order.id, execution_id=execution_id, quantity=qty, price=price, charge=charge)
+    execution = Execution(account_id=order.account_id, order_id=order.id, execution_id=execution_id, quantity=qty, price=price, charge=charge, executed_at=executed_at)
     db.add(execution)
     position = db.scalar(select(Position).where(Position.account_id == order.account_id, Position.subscription_id == order.subscription_id, Position.symbol == order.symbol))
     if not position:
@@ -129,6 +156,7 @@ def apply_fill(db: Session, order: Order, execution_id: str, qty: int, price: De
     signed_fill = qty if order.side == "BUY" else -qty
     old_qty = position.quantity
     old_avg = d(position.average_price)
+    previous_realized = d(position.realized_pnl)
     new_qty = old_qty + signed_fill
     if old_qty == 0 or (old_qty > 0) == (signed_fill > 0):
         position.average_price = d((abs(old_qty) * old_avg + abs(signed_fill) * price) / abs(new_qty))
@@ -143,6 +171,13 @@ def apply_fill(db: Session, order: Order, execution_id: str, qty: int, price: De
     position.quantity = new_qty
     position.last_price = price
     position.charges = d(position.charges + charge)
+    trading_day = executed_at.astimezone(timezone(timedelta(hours=5, minutes=30))).date().isoformat()
+    ledger = db.scalar(select(StrategyDay).where(StrategyDay.subscription_id == order.subscription_id, StrategyDay.trading_day == trading_day))
+    if not ledger:
+        ledger = StrategyDay(subscription_id=order.subscription_id, trading_day=trading_day, realized_pnl=d(0), charges=d(0))
+        db.add(ledger)
+    ledger.realized_pnl = d(ledger.realized_pnl + position.realized_pnl - previous_realized)
+    ledger.charges = d(ledger.charges + charge)
     previous_value = d(order.average_fill_price) * order.filled_qty
     order.filled_qty += qty
     order.reserved_qty = max(0, order.requested_qty - order.filled_qty)
@@ -166,6 +201,8 @@ def reject_risk(db: Session, account_id: int, subscription_id: int, code: str, m
 
 
 def submit_order(db: Session, account: Account, subscription: Subscription, side: str, qty: int, price: Decimal, scenario: str = "full", client_id: Optional[str] = None, close_only: bool = False) -> Order:
+    if settings.is_021:
+        raise RuntimeError("021 orders may only be submitted by the reconciled execution worker")
     client_id = client_id or f"sim-{uuid.uuid4().hex}"
     existing = db.scalar(select(Order).where(Order.account_id == account.id, Order.client_order_id == client_id))
     if existing:
@@ -193,7 +230,7 @@ def submit_order(db: Session, account: Account, subscription: Subscription, side
             if net <= -d(subscription.max_daily_loss):
                 return reject_risk(db, account.id, subscription.id, "DAILY_LOSS", "Daily net loss limit reached", client_id, subscription.symbol, side, qty)
     request = BrokerOrderRequest(client_id, subscription.symbol, side, qty)
-    ack = upstox_sandbox_broker.place_order(request) if settings.is_upstox_sandbox else simulator_broker.place_order(request, scenario)
+    ack = simulator_broker.place_order(request, scenario)
     order = Order(account_id=account.id, subscription_id=subscription.id, client_order_id=client_id, broker_order_id=ack.broker_order_id, symbol=subscription.symbol, side=side, requested_qty=qty, reserved_qty=qty, status=ack.status, reason=ack.reason, close_only=close_only)
     db.add(order)
     db.commit()
@@ -201,9 +238,6 @@ def submit_order(db: Session, account: Account, subscription: Subscription, side
     record_simulation_event(db, account.id, "ORDER_ACK", f"{side} {qty} {subscription.symbol}", f"{scenario} scenario · {order.status}")
     if ack.status == "REJECTED":
         order.reserved_qty = 0
-        db.commit()
-    elif settings.is_upstox_sandbox:
-        record_simulation_event(db, account.id, "ORDER_ACK", f"Upstox Sandbox accepted {side} {qty} {subscription.symbol}", "Awaiting Upstox Sandbox lifecycle update")
         db.commit()
     else:
         for execution in simulator_broker.execution_plan(ack, qty, price, scenario):
@@ -225,11 +259,12 @@ def submit_order(db: Session, account: Account, subscription: Subscription, side
     return order
 
 
-def mark_symbol(db: Session, account_id: int, symbol: str, price: Decimal):
+def mark_symbol(db: Session, account_id: int, symbol: str, price: Decimal, *, commit: bool = True):
     """Mark each strategy sub-ledger to the most recent broker trade."""
     for position in db.scalars(select(Position).where(Position.account_id == account_id, Position.symbol == symbol)).all():
         position.last_price = d(price)
-    db.commit()
+    if commit:
+        db.commit()
 
 
 def aggregate_account(db: Session, account_id: int):
@@ -254,12 +289,7 @@ def perform_kill(db: Session, account: Account, actor_id: int):
     db.commit()
     account.kill_state = "CANCELLING"
     for order in db.scalars(select(Order).where(Order.account_id == account.id, Order.status.in_(["ACKNOWLEDGED", "PARTIALLY_FILLED", "SUBMITTING", "UNKNOWN"]))).all():
-        if settings.is_upstox_sandbox and order.broker_order_id and not order.broker_order_id.startswith("SIM-"):
-            acknowledgement = upstox_sandbox_broker.cancel_order(order.broker_order_id)
-            order.status = acknowledgement.status
-            order.reason = acknowledgement.reason
-        else:
-            order.status = "CANCELLED"
+        order.status = "CANCELLED"
         if order.status == "CANCELLED":
             order.reserved_qty = 0
     db.commit()
@@ -267,13 +297,6 @@ def perform_kill(db: Session, account: Account, actor_id: int):
     db.commit()
     for position in db.scalars(select(Position).where(Position.account_id == account.id, Position.quantity != 0)).all():
         sub = db.get(Subscription, position.subscription_id)
-        if settings.is_upstox_sandbox and position.symbol == "RELIANCE":
-            # Retire a legacy simulator position locally; it was never sent to Upstox.
-            position.quantity = 0
-            position.average_price = d(0)
-            record_simulation_event(db, account.id, "MIGRATION", "Retired legacy simulator RELIANCE position", "No Upstox order was sent")
-            db.commit()
-            continue
         side = "SELL" if position.quantity > 0 else "BUY"
         submit_order(db, account, sub, side, abs(position.quantity), position.last_price, client_id=f"kill-{account.id}-{position.id}", close_only=True)
     remaining = db.scalar(select(func.count(Position.id)).where(Position.account_id == account.id, Position.quantity != 0)) or 0

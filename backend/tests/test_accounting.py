@@ -40,23 +40,6 @@ def test_partial_scenario_leaves_the_unfilled_balance_pending(client, auth):
     assert order["requested_qty"] == 10
 
 
-def test_upstox_sandbox_submission_uses_broker_ack_without_simulated_fill(client, auth, monkeypatch):
-    from app.brokers.contracts import BrokerAcknowledgement
-    from app.config import settings
-    from app import services
-
-    sub = setup_running(client, auth)[0]
-    monkeypatch.setattr(settings, "environment", "UPSTOX_SANDBOX")
-    monkeypatch.setattr(services.upstox_sandbox_broker, "place_order", lambda request: BrokerAcknowledgement("upstox-order-1", "ACKNOWLEDGED"))
-    with SessionLocal() as db:
-        account = db.get(Account, 1)
-        subscription = db.get(Subscription, sub["id"])
-        order = submit_order(db, account, subscription, "BUY", 10, Decimal("100"), client_id="upstox-test-1")
-        assert order.broker_order_id == "upstox-order-1"
-        assert order.status == "ACKNOWLEDGED"
-        assert order.filled_qty == 0
-
-
 def test_opposing_strategies_reconcile_and_kill_flattens(client, auth):
     first, second, *_ = setup_running(client, auth)
     client.post("/api/v1/simulator/orders", headers=auth, json={"subscription_id": first["id"], "side": "BUY", "quantity": 40, "price": 100, "scenario": "full"})
