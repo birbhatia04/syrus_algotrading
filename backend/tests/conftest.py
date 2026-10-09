@@ -3,6 +3,11 @@ os.environ["DATABASE_URL"] = "sqlite:///./test_aegis.db"
 # Tests cover deterministic simulator behaviour and must never inherit the
 # developer's local broker selection or credentials.
 os.environ["ENVIRONMENT"] = "SIMULATOR"
+# Pin the documented NSE session so tests stay hermetic when a deployment
+# widens the window for the sandbox feed.
+os.environ["MARKET_OPEN_IST"] = "09:15"
+os.environ["MARKET_CLOSE_IST"] = "15:15"
+os.environ["TIME_ENTRY_WINDOW_SECONDS"] = "60"
 
 import pytest
 from fastapi.testclient import TestClient

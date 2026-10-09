@@ -8,6 +8,7 @@ import pytest
 from sqlalchemy import select
 from app.brokers.broker_021 import Broker021Adapter, BrokerError
 from app.brokers.feed_021 import decode_market, decode_order_event, EPOCH_OFFSET
+from app.charges import charge_for, compute_charges
 from app.config import settings
 from app.database import SessionLocal
 from app.engine_021 import TradingEngine
@@ -147,7 +148,7 @@ def test_partial_fills_replay_and_opposing_strategy_attribution(live_setup):
     with SessionLocal() as db:
         order=db.scalar(select(Order))
         assert order.filled_qty==4 and order.reserved_qty==6
-        assert db.scalar(select(Position)).charges==Decimal("0.2000")
+        assert db.scalar(select(Position)).charges==charge_for("BUY",Decimal("100"),4)
         assert len(db.scalars(select(Execution)).all())==1
     asyncio.run(engine.submit(2,-3,"short",NOW))
     broker.fill("101",-3,10100)

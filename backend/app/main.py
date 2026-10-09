@@ -12,6 +12,7 @@ from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 from .config import settings
+from .charges import schedule
 from .database import Base, SessionLocal, engine, get_db
 from .models import Account, AuditEvent, Candle, Execution, Order, Position, RiskEvent, Session as AuthSession, SimulationEvent, SimulatorSession, Strategy, Subscription, User, UserProfile
 from .security import create_session, current_user, hash_password, user_account, verify_password
@@ -103,8 +104,17 @@ def sub_json(db, sub):
     return {"id": sub.id, "strategy_id": sub.strategy_id, "name": strategy.name, "timeframe": strategy.timeframe, "symbol": sub.symbol, "status": sub.status, "parameters": json.loads(sub.parameters), "max_daily_loss": num(sub.max_daily_loss), "max_position_size": sub.max_position_size, "max_orders_per_minute": sub.max_orders_per_minute, "quantity": position.quantity if position else 0, "net_pnl": num(net), "daily_net_pnl": num(today)}
 
 
-def order_json(order):
-    return {"id": order.id, "subscription_id": order.subscription_id, "client_order_id": order.client_order_id, "broker_order_id": order.broker_order_id, "symbol": order.symbol, "side": order.side, "requested_qty": order.requested_qty, "filled_qty": order.filled_qty, "remaining_qty": order.requested_qty - order.filled_qty, "average_fill_price": num(order.average_fill_price), "status": order.status, "reason": order.reason, "close_only": order.close_only, "created_at": iso(order.created_at)}
+def strategy_labels(db, account_id):
+    rows = db.execute(
+        select(Subscription.id, Subscription.strategy_id, Strategy.name)
+        .join(Strategy, Strategy.id == Subscription.strategy_id)
+        .where(Subscription.account_id == account_id)
+    ).all()
+    return {sub_id: (strategy_id, name) for sub_id, strategy_id, name in rows}
+
+
+def order_json(order, strategy_id=None, strategy_name=None):
+    return {"id": order.id, "subscription_id": order.subscription_id, "strategy_id": strategy_id, "strategy_name": strategy_name, "client_order_id": order.client_order_id, "broker_order_id": order.broker_order_id, "symbol": order.symbol, "side": order.side, "requested_qty": order.requested_qty, "filled_qty": order.filled_qty, "remaining_qty": order.requested_qty - order.filled_qty, "average_fill_price": num(order.average_fill_price), "status": order.status, "reason": order.reason, "close_only": order.close_only, "created_at": iso(order.created_at)}
 
 
 @app.get("/api/v1/health/live")
@@ -269,23 +279,26 @@ def parameters(sub_id: int, body: ParametersBody, user: User = Depends(current_u
 def dashboard(user: User = Depends(current_user), db: Session = Depends(get_db)):
     account = user_account(user, db); totals = aggregate_account(db, account.id)
     orders = db.scalars(select(Order).where(Order.account_id == account.id).order_by(Order.created_at.desc()).limit(6)).all()
+    labels = strategy_labels(db, account.id)
     subs = db.scalars(select(Subscription).where(Subscription.account_id == account.id)).all()
     session = db.get(SimulatorSession, account.id)
     broker_state = db.get(BrokerState, account.id)
     active = bool(broker_state and broker_state.enabled) if settings.is_021 else bool(session and session.active)
-    return {"environment": settings.environment, "currency": settings.currency, "default_symbol": settings.broker_021_default_symbol if settings.is_021 else "RELIANCE", "feed_active": active, "charges_assumed": True, "charge_rate": num(settings.assumed_charge_rate), "account": {"id": account.id, "name": account.name, "kill_state": account.kill_state, "recovered": account.recovered and (not settings.is_021 or (datetime.now(timezone.utc) - utc(account.worker_heartbeat)).total_seconds() < 5), "worker_heartbeat": iso(account.worker_heartbeat)}, "pnl": {k: num(v) for k, v in totals.items() if k != "positions"}, "aggregate_positions": totals["positions"], "running_strategies": sum(1 for s in subs if s.status == "RUNNING"), "subscriptions": len(subs), "recent_orders": [order_json(o) for o in orders]}
+    return {"environment": settings.environment, "currency": settings.currency, "default_symbol": settings.broker_021_default_symbol if settings.is_021 else "RELIANCE", "feed_active": active, "charges_assumed": False, "charge_schedule": schedule(), "account": {"id": account.id, "name": account.name, "kill_state": account.kill_state, "recovered": account.recovered and (not settings.is_021 or (datetime.now(timezone.utc) - utc(account.worker_heartbeat)).total_seconds() < 5), "worker_heartbeat": iso(account.worker_heartbeat)}, "pnl": {k: num(v) for k, v in totals.items() if k != "positions"}, "aggregate_positions": totals["positions"], "running_strategies": sum(1 for s in subs if s.status == "RUNNING"), "subscriptions": len(subs), "recent_orders": [order_json(o, *labels.get(o.subscription_id, (None, None))) for o in orders]}
 
 
 @app.get("/api/v1/orders")
 def orders(limit: int = Query(100, le=500), user: User = Depends(current_user), db: Session = Depends(get_db)):
     account = user_account(user, db)
-    return [order_json(o) for o in db.scalars(select(Order).where(Order.account_id == account.id).order_by(Order.created_at.desc()).limit(limit)).all()]
+    labels = strategy_labels(db, account.id)
+    return [order_json(o, *labels.get(o.subscription_id, (None, None))) for o in db.scalars(select(Order).where(Order.account_id == account.id).order_by(Order.created_at.desc()).limit(limit)).all()]
 
 
 @app.get("/api/v1/trades")
 def trades(user: User = Depends(current_user), db: Session = Depends(get_db)):
-    account = user_account(user, db); rows = db.execute(select(Execution, Order).join(Order, Execution.order_id == Order.id).where(Execution.account_id == account.id).order_by(Execution.executed_at.desc())).all()
-    return [{"id": e.id, "execution_id": e.execution_id, "order_id": o.id, "subscription_id": o.subscription_id, "symbol": o.symbol, "side": o.side, "quantity": e.quantity, "price": num(e.price), "charge": num(e.charge), "executed_at": iso(e.executed_at)} for e, o in rows]
+    account = user_account(user, db); labels = strategy_labels(db, account.id)
+    rows = db.execute(select(Execution, Order).join(Order, Execution.order_id == Order.id).where(Execution.account_id == account.id).order_by(Execution.executed_at.desc())).all()
+    return [{"id": e.id, "execution_id": e.execution_id, "order_id": o.id, "subscription_id": o.subscription_id, "strategy_id": labels.get(o.subscription_id, (None, None))[0], "strategy_name": labels.get(o.subscription_id, (None, None))[1], "symbol": o.symbol, "side": o.side, "quantity": e.quantity, "price": num(e.price), "charge": num(e.charge), "executed_at": iso(e.executed_at)} for e, o in rows]
 
 
 @app.get("/api/v1/positions")
@@ -349,13 +362,15 @@ def market_feed(user: User = Depends(current_user), db: Session = Depends(get_db
 def simulator_order(body: SimOrderBody, user: User = Depends(current_user), db: Session = Depends(get_db)):
     if settings.is_021: raise HTTPException(409, "Simulator orders are disabled in 021 mode")
     account = user_account(user, db); sub = owned_sub(db, account.id, body.subscription_id)
-    return order_json(submit_order(db, account, sub, body.side, body.quantity, body.price, body.scenario, body.client_order_id))
+    labels = strategy_labels(db, account.id)
+    return order_json(submit_order(db, account, sub, body.side, body.quantity, body.price, body.scenario, body.client_order_id), *labels.get(sub.id, (None, None)))
 
 
 @app.post("/api/v1/simulator/demo")
 def simulator_demo(body: DemoBody = DemoBody(), user: User = Depends(current_user), db: Session = Depends(get_db)):
     if settings.is_021: raise HTTPException(409, "Simulator demo is disabled in 021 mode")
     account = user_account(user, db); subs = db.scalars(select(Subscription).where(Subscription.account_id == account.id)).all()
+    labels = strategy_labels(db, account.id)
     run_id = f"run-{uuid.uuid4().hex[:10]}"
     if body.scenario != "vertical":
         if not subs: raise HTTPException(409, "Subscribe to at least one strategy first")
@@ -367,7 +382,7 @@ def simulator_demo(body: DemoBody = DemoBody(), user: User = Depends(current_use
         else:
             order = submit_order(db, account, sub, "BUY", 10, d("2550"), body.scenario, client_id=f"{run_id}-{sub.id}")
             record_simulation_event(db, account.id, "SCENARIO", f"{body.scenario.replace('_', ' ')} scenario completed", f"Order #{order.id}", run_id); db.commit()
-        return {"run_id": run_id, "message": f"{body.scenario} simulator scenario completed", "orders": [order_json(order)]}
+        return {"run_id": run_id, "message": f"{body.scenario} simulator scenario completed", "orders": [order_json(order, *labels.get(sub.id, (None, None)))]}
     if len(subs) < 3: raise HTTPException(409, "Subscribe to all three strategies first")
     base = datetime.now(timezone.utc).replace(second=0, microsecond=0) - timedelta(minutes=12)
     prices = [2500, 2496, 2492, 2498, 2504, 2512, 2520, 2514, 2507, 2499, 2518, 2532, 2544, 2550]
@@ -379,9 +394,9 @@ def simulator_demo(body: DemoBody = DemoBody(), user: User = Depends(current_use
         signal = evaluate_strategy(db, sub)
         side, quantity = (signal[0], signal[1]) if signal else (("SELL" if i == 1 else "BUY"), [10, 8, 12][i])
         record_simulation_event(db, account.id, "SIGNAL", f"{sub.name if hasattr(sub, 'name') else sub.strategy_id} emitted {side}", "Closed-candle strategy evaluation", run_id)
-        results.append(order_json(submit_order(db, account, sub, side, quantity, d(prices[-1] + i), "partial" if i == 0 else "full", client_id=f"demo-{account.id}-{run_id}-{sub.id}")))
+        results.append(order_json(submit_order(db, account, sub, side, quantity, d(prices[-1] + i), "partial" if i == 0 else "full", client_id=f"demo-{account.id}-{run_id}-{sub.id}"), *labels.get(sub.id, (None, None))))
     # Deliberate risk violation demonstrates enforcement outside strategy code.
-    results.append(order_json(submit_order(db, account, subs[0], "BUY", subs[0].max_position_size + 1, d(prices[-1]), client_id=f"demo-risk-{account.id}-{run_id}")))
+    results.append(order_json(submit_order(db, account, subs[0], "BUY", subs[0].max_position_size + 1, d(prices[-1]), client_id=f"demo-risk-{account.id}-{run_id}"), *labels.get(subs[0].id, (None, None))))
     record_simulation_event(db, account.id, "RUN_COMPLETE", "Vertical demo completed", "Candles, signals, fills, positions and risk rejection recorded", run_id); db.commit()
     return {"run_id": run_id, "message": "Deterministic candle, partial-fill, opposing-position and risk scenarios completed", "orders": results}
 

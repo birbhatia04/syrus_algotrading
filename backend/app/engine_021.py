@@ -5,7 +5,7 @@ import json
 import logging
 import time
 import uuid
-from datetime import datetime, timedelta, timezone, time as wall_time
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from sqlalchemy import select, update
 from .brokers.broker_021 import Broker021Adapter, BrokerError
@@ -13,7 +13,7 @@ from .brokers.feed_021 import EPOCH_OFFSET
 from .config import settings
 from .database import SessionLocal
 from .models import Account, AuditEvent, BrokerState, Execution, Instrument, MarketQuote, Order, OrderRoute, Position, RiskEvent, StrategyDay, Subscription
-from .services import apply_fill, d, ingest_tick, mark_symbol, record_simulation_event
+from .services import apply_fill, d, ingest_tick, mark_symbol, rebuild_charges, record_simulation_event
 from .trading_rules import IST, OPEN_STATES, SUPPORTED, daily_net, day_ledger, day_string, open_orders, risk_reason, strategy_decision, sub_position, utc
 
 log = logging.getLogger(__name__)
@@ -107,20 +107,29 @@ class TradingEngine:
                         setattr(instrument, key, value)
             db.commit()
 
+    @staticmethod
+    def tick_time(stamp, now):
+        """Fall back to receipt time when the sandbox publishes a frozen/implausible stamp."""
+        stamp = utc(stamp)
+        if abs((stamp - utc(now)).total_seconds()) > settings.tick_time_tolerance_seconds:
+            return utc(now)
+        return stamp
+
     def accept_ticks(self, ticks, now):
         with self.session_factory() as db:
             for tick in ticks:
-                if tick.exchange != 1 or tick.price_paise <= 0 or utc(tick.timestamp) > utc(now):
+                if tick.exchange != 1 or tick.price_paise <= 0:
                     continue
+                stamp = self.tick_time(tick.timestamp, now)
                 instrument = db.scalar(select(Instrument).where(Instrument.token == tick.token))
                 if not instrument:
                     continue
                 old = db.get(MarketQuote, instrument.symbol)
-                if old and utc(tick.timestamp) < utc(old.market_at):
+                if old and utc(stamp) < utc(old.market_at):
                     continue
-                if old and utc(tick.timestamp) == utc(old.market_at) and tick.volume == old.cumulative_volume and d(Decimal(tick.price_paise) / 100) == old.price:
+                if old and utc(stamp) == utc(old.market_at) and tick.volume == old.cumulative_volume and d(Decimal(tick.price_paise) / 100) == old.price:
                     continue
-                same_day = old and day_string(old.market_at) == day_string(tick.timestamp)
+                same_day = old and day_string(old.market_at) == day_string(stamp)
                 # Snapshot volume is cumulative. Initial volume is unknown for this candle.
                 volume_delta = None
                 if same_day and old.cumulative_volume is not None and tick.volume is not None:
@@ -129,14 +138,14 @@ class TradingEngine:
                 day_open = Decimal(tick.open_paise or 0) / 100
                 if old is None:
                     old = MarketQuote(symbol=instrument.symbol, price=price, day_open=day_open,
-                                      market_at=tick.timestamp, received_at=now, cumulative_volume=tick.volume)
+                                      market_at=stamp, received_at=now, cumulative_volume=tick.volume)
                     db.add(old)
                 else:
                     old.price = price
                     old.day_open = day_open or (old.day_open if same_day else Decimal(0))
-                    old.market_at, old.received_at, old.cumulative_volume = tick.timestamp, now, tick.volume
+                    old.market_at, old.received_at, old.cumulative_volume = stamp, now, tick.volume
                 db.flush()
-                ingest_tick(db, instrument.symbol, price, tick.timestamp, volume_delta, commit=False)
+                ingest_tick(db, instrument.symbol, price, stamp, volume_delta, commit=False)
                 mark_symbol(db, self.account_id, instrument.symbol, price, commit=False)
                 db.commit()
 
@@ -234,23 +243,10 @@ class TradingEngine:
                         f"INTRADAY broker trade {trade['tradeId']} for token "
                         f"{trade.get('token')} is missing from the strategy ledger"
                     )
-            # Charges are derived data. Rebuild their daily buckets from the
-            # immutable executions after any broker timestamp normalization.
-            charge_totals = {}
-            for sub_id, charge, executed_at in db.execute(select(
-                Order.subscription_id, Execution.charge, Execution.executed_at
-            ).join(Execution, Execution.order_id == Order.id).where(Order.account_id == account.id)):
-                bucket = (sub_id, day_string(executed_at))
-                charge_totals[bucket] = d(charge_totals.get(bucket, 0) + charge)
-            ledgers = db.scalars(select(StrategyDay).join(
-                Subscription, Subscription.id == StrategyDay.subscription_id
-            ).where(Subscription.account_id == account.id)).all()
-            existing_ledgers = {(ledger.subscription_id, ledger.trading_day): ledger for ledger in ledgers}
-            for key, ledger in existing_ledgers.items():
-                ledger.charges = charge_totals.get(key, Decimal(0))
-            for (sub_id, trading_day), charges in charge_totals.items():
-                if (sub_id, trading_day) not in existing_ledgers:
-                    db.add(StrategyDay(subscription_id=sub_id, trading_day=trading_day, charges=charges))
+            # Charges are derived data: recompute each execution from its
+            # immutable price/quantity/side against the active schedule after any
+            # broker timestamp normalization, and rebuild position/day totals.
+            rebuild_charges(db, account.id)
             local = {}
             for position in db.scalars(select(Position).where(Position.account_id == account.id)).all():
                 instrument = db.get(Instrument, position.symbol)
@@ -388,7 +384,7 @@ class TradingEngine:
                 quote = db.get(MarketQuote, sub.symbol)
                 if not instrument:
                     continue
-                if utc(now).astimezone(IST).time() >= wall_time(15, 15):
+                if utc(now).astimezone(IST).time() >= settings.market_close:
                     ledger.exiting = True
                 position = sub_position(db, sub)
                 latest_fill = db.scalar(select(Execution).join(Order).where(

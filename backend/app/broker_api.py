@@ -7,6 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 from .brokers.broker_021 import Broker021Adapter, BrokerError
+from .charges import schedule
 from .config import settings
 from .database import get_db
 from .engine_021 import state_for, lock_account
@@ -41,7 +42,7 @@ def status(user: User = Depends(current_user), db: Session = Depends(get_db)):
         "reconciled": bool(account.recovered and fresh),
         "last_error": state.last_error if state else "Start the execution worker",
         "kill_elapsed_ms": state.kill_elapsed_ms if state else None,
-        "charge_rate": float(settings.assumed_charge_rate), "charges_assumed": True,
+        "charge_schedule": schedule(), "charges_assumed": False,
     }
 
 

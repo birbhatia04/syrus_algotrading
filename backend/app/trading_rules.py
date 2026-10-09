@@ -84,8 +84,10 @@ def risk_reason(db, account, state, sub, instrument, quote, signed_qty, now, clo
     if not state.market_connected or not quote_fresh(quote, now):
         return "STALE_MARKET", "Fresh market data is required for new exposure"
     local_time = utc(now).astimezone(IST).time()
-    if not time(9, 15) <= local_time < time(15, 15):
-        return "MARKET_SESSION", "New entries are allowed from 09:15 to 15:15 IST"
+    if not settings.market_open <= local_time < settings.market_close:
+        return "MARKET_SESSION", (
+            f"New entries are allowed from {settings.market_open_ist} to {settings.market_close_ist} IST"
+        )
     buys = sum(o.reserved_qty for o in pending if o.side == "BUY")
     sells = sum(o.reserved_qty for o in pending if o.side == "SELL")
     buys += max(0, signed_qty)
@@ -124,7 +126,7 @@ def strategy_decision(db, sub, quote, instrument, now):
     params = json.loads(sub.parameters)
     day = day_string(now)
     local_time = utc(now).astimezone(IST).time()
-    if local_time >= time(15, 15) or ledger.loss_latched:
+    if local_time >= settings.market_close or ledger.loss_latched:
         ledger.exiting = True
     if sub.strategy_id == "open_breakout" and qty and quote_fresh(quote, now):
         entry = position.average_price
@@ -139,7 +141,7 @@ def strategy_decision(db, sub, quote, instrument, now):
         return None
     quantity = int(params.get("quantity", 1))
     if sub.strategy_id == "time_entry":
-        if sub.status == "RUNNING" and not qty and not ledger.entry_attempted and time(9, 15) <= local_time < time(9, 16):
+        if sub.status == "RUNNING" and not qty and not ledger.entry_attempted and settings.market_open <= local_time < settings.time_entry_deadline:
             return Decision(quantity if params.get("side", "BUY") == "BUY" else -quantity, f"time-{day}")
     elif sub.strategy_id == "open_breakout":
         if sub.status == "RUNNING" and not qty and not ledger.entry_attempted and quote.day_open > 0 and day_string(quote.market_at) == day:
@@ -148,7 +150,7 @@ def strategy_decision(db, sub, quote, instrument, now):
             if quote.price <= quote.day_open * Decimal("0.99"):
                 return Decision(-quantity, f"breakout-{day}")
     elif sub.strategy_id == "ma_cross":
-        start = datetime.combine(utc(now).astimezone(IST).date(), time(9, 15), IST).astimezone(timezone.utc)
+        start = datetime.combine(utc(now).astimezone(IST).date(), settings.market_open, IST).astimezone(timezone.utc)
         entry_count = db.scalar(select(func.count(Order.id)).where(
             Order.subscription_id == sub.id,
             Order.close_only.is_(False),

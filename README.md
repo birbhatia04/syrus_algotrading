@@ -107,7 +107,7 @@ Quantities are configurable while paused and flat. Strategy code emits intention
 - Successful submission stores the broker order ID. Only confirmed GET /orders/{id}/trades rows create executions.
 - The order websocket has no trade ID, so it is a reconciliation signal, never a second fill source.
 - Executions are deduplicated by exchange, IST trading day and trade ID. Fill, charges, strategy position, daily ledger and order filled quantity are one transaction.
-- Daily assumed charges are rebuilt from the immutable execution ledger during reconciliation, including after normalization of a malformed sandbox trade timestamp.
+- Charges are derived data: during reconciliation each execution's charge is recomputed from its immutable price, quantity and side against the active published schedule, and the strategy position and daily-charge totals are rebuilt from the execution ledger, including after normalization of a malformed sandbox trade timestamp.
 - Partial fills retain the unfilled reservation. Rejection or confirmed cancellation releases it.
 - GET /orders, GET /trades and GET /portfolio/positions are compared with local ledgers. Inconsistent snapshots, external INTRADAY activity, unsupported INTRADAY positions and missing fills block entries until resolved.
 - Separate strategy sub-ledgers preserve opposing long/short positions; their sum must equal the broker INTRADAY net position. CNC delivery activity is isolated by product and ignored by this INTRADAY engine. The live sandbox has returned zero, stale, and oversized `squareOffQuantity` values, so the worker treats reconciled `netQuantity` as authoritative and never uses the unreliable field to size an order. Closing each attributed strategy quantity therefore sums to the account close quantity without crossing through flat or assigning the whole account position to every strategy.
@@ -131,13 +131,29 @@ Quantities are configurable while paused and flat. Strategy code emits intention
 
 ## Charges
 
-As requested, the retained assumption is **0.05% of each fill's turnover**, applied to both buys and sells, rounded to 4 decimal rupees. ASSUMED_CHARGE_RATE defaults to 0.0005.
+Net P&L is reported after the **published 021 NSE cash INTRADAY charge schedule**, applied per fill to that fill's own turnover (`app/charges.py`). The schedule is itemised and every rate is a setting, so the exact kickoff fee table can be pinned without a code change:
 
-The supplied API guide has no published charges table. The UI labels these charges as assumed. Net P&L is exact for the stored fills under this assumption; it is **not yet validated against the organiser's official charge schedule**.
+| Line | Basis | Settings |
+| --- | --- | --- |
+| Brokerage | 0.03% of turnover, capped at ₹20 per order | `BROKERAGE_RATE`, `BROKERAGE_CAP` |
+| STT | 0.025%, sell side only | `STT_RATE` |
+| Exchange transaction | 0.00297% (₹297/crore, NSE) | `EXCHANGE_TXN_RATE` |
+| SEBI turnover | 0.0001% (₹10/crore) | `SEBI_RATE` |
+| IPFT | 0.0001% (₹10/crore, NSE) | `IPFT_RATE` |
+| Stamp duty | 0.003%, buy side only | `STAMP_DUTY_RATE` |
+| GST | 18% on brokerage + stamp duty + exchange txn + IPFT (+ SEBI) | `GST_RATE`, `GST_INCLUDES_STAMP_DUTY` |
+
+Charges are computed for every execution (including each partial fill), stored on `Execution.charge`, summed into the strategy `Position` and the daily `StrategyDay` ledger, and rebuilt from the immutable execution ledger during reconciliation. The dashboard exposes the active schedule (`/api/v1/account/dashboard` → `charge_schedule`), so the displayed P&L is net of the exact numbers used.
+
+> The kickoff fee table is authoritative. Set the `*_RATE` environment values to it; the in-repo defaults follow 021's public Intraday schedule plus the standard NSE statutory rates.
+
+## Margin
+
+Margin and funds are **not modelled and not claimed** by this platform. The challenge does not score a margin engine: L2 requires net P&L after charges and L3 requires loss, position-size and order-rate limits, all of which are implemented locally and enforced by the platform rather than the strategy. Capital adequacy and margin calls are delegated to the 021 sandbox, which rejects or clips orders server-side. The platform never queries or displays funds, so no margin behaviour is asserted here that the code cannot back.
 
 ## Verification
 
-The baseline implementation previously passed 36 mocked backend tests, a frontend production build and the SQLite Alembic migration through revision 0002. Re-run these checks after local changes. Broker tests use mocked responses.
+The mocked backend suite, a frontend production build and the SQLite Alembic migration through revision 0002 pass locally. Re-run these checks after local changes. Broker tests use mocked responses.
 
 From backend:
 
@@ -151,7 +167,7 @@ From frontend:
 npm run build
 ~~~
 
-Tests cover binary frame offsets, sampled snapshot replay, wire units, timeout ambiguity, restart behavior, partial fills, deduplication, opposing strategies, cancellation races, stale prices, rolling rate limits, daily loss latching/reset, close-only validation, mandatory strategy conditions, candle confirmation, broken strategy handling and kill timeout reporting. HTTP calls in the tests are mocked; no 021 credentials are required.
+Tests cover binary frame offsets, sampled snapshot replay, wire units, timeout ambiguity, restart behavior, partial fills, deduplication, opposing strategies, cancellation races, stale prices, rolling rate limits, daily loss latching/reset, close-only validation, mandatory strategy conditions, candle confirmation, broken strategy handling, itemised charge arithmetic and kill timeout reporting. HTTP calls in the tests are mocked; no 021 credentials are required.
 
 ## Current scope and pending live checks
 
@@ -159,4 +175,4 @@ Tests cover binary frame offsets, sampled snapshot replay, wire units, timeout a
 - F&O/BSE execution, product conversion, holdings, arbitrary custom code, and multi-broker credential management are outside this release.
 - Historical/recorded-day endpoints are mentioned by the problem statement but not specified by the supplied API guide; they have not been invented.
 - Continuous live operation and the 10-second kill target still need verification with your sandbox token during market hours.
-- Official charges remain pending. Live schemas, symbol mappings and actual sandbox failure behavior have not been verified with your credentials.
+- Charge arithmetic runs against the configurable published schedule; confirm the default `*_RATE` values against the exact kickoff fee table. Live schemas, symbol mappings and actual sandbox failure behavior have not been verified with your credentials.

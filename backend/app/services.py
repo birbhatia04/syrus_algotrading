@@ -9,10 +9,12 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from .brokers import simulator_broker
 from .brokers.contracts import BrokerOrderRequest
+from .charges import charge_for
 from .config import settings
 from .models import Account, AuditEvent, Candle, Execution, Order, Position, RiskEvent, SimulationEvent, Strategy, Subscription, StrategyDay
 
 MONEY = Decimal("0.0001")
+IST = timezone(timedelta(hours=5, minutes=30))
 TERMINAL = {"FILLED", "CANCELLED", "REJECTED", "RISK_REJECTED"}
 
 
@@ -136,16 +138,17 @@ def position_values(position: Position):
     return unrealized, net
 
 
-def apply_fill(db: Session, order: Order, execution_id: str, qty: int, price: Decimal, charge_rate: Decimal | None = None, executed_at: datetime | None = None) -> bool:
+def apply_fill(db: Session, order: Order, execution_id: str, qty: int, price: Decimal, executed_at: datetime | None = None) -> bool:
     """Apply one incremental execution atomically. Unique execution IDs make replay a no-op."""
     if db.scalar(select(Execution).where(Execution.account_id == order.account_id, Execution.execution_id == execution_id)):
         return False
     if qty <= 0 or order.filled_qty + qty > order.requested_qty:
         raise ValueError("Invalid incremental execution quantity")
-    charge_rate = settings.assumed_charge_rate if charge_rate is None else charge_rate
     executed_at = executed_at or datetime.now(timezone.utc)
     price = d(price)
-    charge = d(price * qty * charge_rate)
+    # Charges come from the published itemised schedule (app/charges.py), applied
+    # per fill to that fill's own turnover.
+    charge = charge_for(order.side, price, qty)
     execution = Execution(account_id=order.account_id, order_id=order.id, execution_id=execution_id, quantity=qty, price=price, charge=charge, executed_at=executed_at)
     db.add(execution)
     position = db.scalar(select(Position).where(Position.account_id == order.account_id, Position.subscription_id == order.subscription_id, Position.symbol == order.symbol))
@@ -171,7 +174,7 @@ def apply_fill(db: Session, order: Order, execution_id: str, qty: int, price: De
     position.quantity = new_qty
     position.last_price = price
     position.charges = d(position.charges + charge)
-    trading_day = executed_at.astimezone(timezone(timedelta(hours=5, minutes=30))).date().isoformat()
+    trading_day = executed_at.astimezone(IST).date().isoformat()
     ledger = db.scalar(select(StrategyDay).where(StrategyDay.subscription_id == order.subscription_id, StrategyDay.trading_day == trading_day))
     if not ledger:
         ledger = StrategyDay(subscription_id=order.subscription_id, trading_day=trading_day, realized_pnl=d(0), charges=d(0))
@@ -190,6 +193,41 @@ def apply_fill(db: Session, order: Order, execution_id: str, qty: int, price: De
         db.rollback()
         return False
     return True
+
+
+def rebuild_charges(db: Session, account_id: int) -> None:
+    """Charges are derived data: recompute every execution from its immutable
+    price/quantity/side against the active published schedule, then rebuild the
+    strategy position and daily-charge totals from that ledger. This keeps a
+    deployment that changes the schedule self-consistent after the fact."""
+    rows = db.execute(
+        select(Order.subscription_id, Order.symbol, Order.side, Execution.id,
+               Execution.price, Execution.quantity, Execution.charge, Execution.executed_at)
+        .join(Execution, Execution.order_id == Order.id)
+        .where(Order.account_id == account_id)
+    ).all()
+    position_totals: dict[tuple[int, str], Decimal] = {}
+    day_totals: dict[tuple[int, str], Decimal] = {}
+    for sub_id, symbol, side, execution_id, price, qty, stored, executed_at in rows:
+        charge = charge_for(side, price, qty)
+        if charge != d(stored):
+            execution = db.get(Execution, execution_id)
+            if execution:
+                execution.charge = charge
+        position_totals[(sub_id, symbol)] = d(position_totals.get((sub_id, symbol), Decimal("0")) + charge)
+        bucket = (sub_id, executed_at.astimezone(IST).date().isoformat())
+        day_totals[bucket] = d(day_totals.get(bucket, Decimal("0")) + charge)
+    for position in db.scalars(select(Position).where(Position.account_id == account_id)).all():
+        position.charges = position_totals.get((position.subscription_id, position.symbol), Decimal("0"))
+    ledgers = {(ledger.subscription_id, ledger.trading_day): ledger for ledger in db.scalars(
+        select(StrategyDay).join(Subscription, Subscription.id == StrategyDay.subscription_id)
+        .where(Subscription.account_id == account_id)).all()}
+    for key, ledger in ledgers.items():
+        ledger.charges = day_totals.get(key, Decimal("0"))
+    for (sub_id, trading_day), charges in day_totals.items():
+        if (sub_id, trading_day) not in ledgers:
+            db.add(StrategyDay(subscription_id=sub_id, trading_day=trading_day, charges=charges))
+    db.commit()
 
 
 def reject_risk(db: Session, account_id: int, subscription_id: int, code: str, message: str, client_id: str, symbol: str, side: str, qty: int):

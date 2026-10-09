@@ -95,3 +95,15 @@ def test_profile_completion_is_persisted(client, auth):
     me = client.get("/api/v1/me", headers=auth).json()
     assert me["profile_complete"] is True
     assert me["profile"]["full_name"] == "Test User"
+
+
+def test_itemised_intraday_charges_follow_the_published_schedule():
+    from app.charges import compute_charges
+    buy = compute_charges("BUY", Decimal("100"), 10)
+    sell = compute_charges("SELL", Decimal("100"), 10)
+    assert buy.stt == Decimal("0") and buy.stamp_duty > 0
+    assert sell.stamp_duty == Decimal("0") and sell.stt > 0
+    assert buy.total == buy.brokerage + buy.stt + buy.exchange_txn + buy.sebi + buy.ipft + buy.stamp_duty + buy.gst
+    assert sell.total == sell.brokerage + sell.stt + sell.exchange_txn + sell.sebi + sell.ipft + sell.stamp_duty + sell.gst
+    capped = compute_charges("BUY", Decimal("1000000"), 1)
+    assert capped.brokerage == Decimal("20")
