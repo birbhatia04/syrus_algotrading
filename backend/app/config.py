@@ -8,10 +8,10 @@ class Settings(BaseSettings):
     environment: str = "SIMULATOR"
     session_hours: int = 24
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
-    alpaca_api_key_id: str = ""
-    alpaca_api_secret_key: str = ""
-    alpaca_data_feed: str = "iex"
-    alpaca_default_symbol: str = "AAPL"
+    upstox_analytics_token: str = ""
+    upstox_sandbox_access_token: str = ""
+    upstox_default_symbol: str = "INFY"
+    upstox_default_instrument_key: str = "NSE_EQ|INE009A01021"
 
     model_config = SettingsConfigDict(env_file=Path(__file__).resolve().parents[2] / ".env", extra="ignore")
 
@@ -20,16 +20,16 @@ class Settings(BaseSettings):
         return [item.strip() for item in self.cors_origins.split(",") if item.strip()]
 
     @property
-    def is_alpaca_paper(self) -> bool:
-        return self.environment.upper() == "ALPACA_PAPER"
+    def is_upstox_sandbox(self) -> bool:
+        return self.environment.upper() == "UPSTOX_SANDBOX"
 
     @property
     def currency(self) -> str:
-        return "USD" if self.is_alpaca_paper else "INR"
+        return "INR"
 
     @property
-    def alpaca_configured(self) -> bool:
-        return bool(self.alpaca_api_key_id and self.alpaca_api_secret_key)
+    def upstox_configured(self) -> bool:
+        return bool(self.upstox_analytics_token and self.upstox_sandbox_access_token)
 
 
 settings = Settings()

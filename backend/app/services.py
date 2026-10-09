@@ -4,10 +4,10 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional, Tuple
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
-from .brokers import alpaca_paper_broker, simulator_broker
+from .brokers import simulator_broker, upstox_sandbox_broker
 from .brokers.contracts import BrokerOrderRequest
 from .config import settings
 from .models import Account, AuditEvent, Candle, Execution, Order, Position, RiskEvent, SimulationEvent, Strategy, Subscription
@@ -193,7 +193,7 @@ def submit_order(db: Session, account: Account, subscription: Subscription, side
             if net <= -d(subscription.max_daily_loss):
                 return reject_risk(db, account.id, subscription.id, "DAILY_LOSS", "Daily net loss limit reached", client_id, subscription.symbol, side, qty)
     request = BrokerOrderRequest(client_id, subscription.symbol, side, qty)
-    ack = alpaca_paper_broker.place_order(request) if settings.is_alpaca_paper else simulator_broker.place_order(request, scenario)
+    ack = upstox_sandbox_broker.place_order(request) if settings.is_upstox_sandbox else simulator_broker.place_order(request, scenario)
     order = Order(account_id=account.id, subscription_id=subscription.id, client_order_id=client_id, broker_order_id=ack.broker_order_id, symbol=subscription.symbol, side=side, requested_qty=qty, reserved_qty=qty, status=ack.status, reason=ack.reason, close_only=close_only)
     db.add(order)
     db.commit()
@@ -202,8 +202,8 @@ def submit_order(db: Session, account: Account, subscription: Subscription, side
     if ack.status == "REJECTED":
         order.reserved_qty = 0
         db.commit()
-    elif settings.is_alpaca_paper:
-        record_simulation_event(db, account.id, "ORDER_ACK", f"Alpaca Paper accepted {side} {qty} {subscription.symbol}", "Awaiting Alpaca order and fill reconciliation")
+    elif settings.is_upstox_sandbox:
+        record_simulation_event(db, account.id, "ORDER_ACK", f"Upstox Sandbox accepted {side} {qty} {subscription.symbol}", "Awaiting Upstox Sandbox lifecycle update")
         db.commit()
     else:
         for execution in simulator_broker.execution_plan(ack, qty, price, scenario):
@@ -232,51 +232,6 @@ def mark_symbol(db: Session, account_id: int, symbol: str, price: Decimal):
     db.commit()
 
 
-def reconcile_alpaca_orders(db: Session, account: Account):
-    """Apply Alpaca activity fills exactly once and mirror terminal order states."""
-    orders = db.scalars(select(Order).where(
-        Order.account_id == account.id,
-        Order.broker_order_id.is_not(None),
-        or_(
-            Order.status.not_in(TERMINAL),
-            (Order.status == "FILLED") & (Order.filled_qty < Order.requested_qty),
-        ),
-    )).all()
-    for order in orders:
-        try:
-            snapshot = alpaca_paper_broker.order(order.broker_order_id)
-            for fill in alpaca_paper_broker.fills(order.broker_order_id):
-                # Alpaca reports commission-free paper fills. Broker fees are not invented.
-                apply_fill(db, order, fill.execution_id, fill.quantity, fill.price, Decimal("0"))
-            db.refresh(order)
-            if snapshot.filled_qty > order.filled_qty:
-                # Activities are the preferred exact execution source. Alpaca's
-                # order snapshot is a safe fallback if the activity feed lags.
-                fallback_qty = snapshot.filled_qty - order.filled_qty
-                fallback_price = snapshot.average_fill_price or d(order.average_fill_price)
-                apply_fill(
-                    db,
-                    order,
-                    f"{order.broker_order_id}-snapshot-{snapshot.filled_qty}",
-                    fallback_qty,
-                    fallback_price,
-                    Decimal("0"),
-                )
-                db.refresh(order)
-            order.status = snapshot.status
-            order.reason = snapshot.reason
-            if snapshot.status in TERMINAL:
-                order.reserved_qty = 0
-            elif snapshot.status == "PARTIALLY_FILLED":
-                order.reserved_qty = max(0, order.requested_qty - order.filled_qty)
-            db.commit()
-        except RuntimeError as error:
-            # Keep the order open for the next reconciliation attempt; do not
-            # fabricate a broker rejection from a transient connectivity issue.
-            order.reason = str(error)
-            db.commit()
-
-
 def aggregate_account(db: Session, account_id: int):
     positions = db.scalars(select(Position).where(Position.account_id == account_id)).all()
     by_symbol: dict[str, int] = {}
@@ -299,10 +254,8 @@ def perform_kill(db: Session, account: Account, actor_id: int):
     db.commit()
     account.kill_state = "CANCELLING"
     for order in db.scalars(select(Order).where(Order.account_id == account.id, Order.status.in_(["ACKNOWLEDGED", "PARTIALLY_FILLED", "SUBMITTING", "UNKNOWN"]))).all():
-        # Historical simulator orders have SIM-* identifiers and never existed
-        # at Alpaca. Cancel those locally when a workspace migrates to Paper.
-        if settings.is_alpaca_paper and order.broker_order_id and not order.broker_order_id.startswith("SIM-"):
-            acknowledgement = alpaca_paper_broker.cancel_order(order.broker_order_id)
+        if settings.is_upstox_sandbox and order.broker_order_id and not order.broker_order_id.startswith("SIM-"):
+            acknowledgement = upstox_sandbox_broker.cancel_order(order.broker_order_id)
             order.status = acknowledgement.status
             order.reason = acknowledgement.reason
         else:
@@ -314,12 +267,11 @@ def perform_kill(db: Session, account: Account, actor_id: int):
     db.commit()
     for position in db.scalars(select(Position).where(Position.account_id == account.id, Position.quantity != 0)).all():
         sub = db.get(Subscription, position.subscription_id)
-        if settings.is_alpaca_paper and position.symbol == "RELIANCE":
-            # RELIANCE only existed in the retired deterministic simulator. It
-            # must be removed from the local ledger, never submitted to Alpaca.
+        if settings.is_upstox_sandbox and position.symbol == "RELIANCE":
+            # Retire a legacy simulator position locally; it was never sent to Upstox.
             position.quantity = 0
             position.average_price = d(0)
-            record_simulation_event(db, account.id, "MIGRATION", "Retired simulator RELIANCE position", "No Alpaca order was sent")
+            record_simulation_event(db, account.id, "MIGRATION", "Retired legacy simulator RELIANCE position", "No Upstox order was sent")
             db.commit()
             continue
         side = "SELL" if position.quantity > 0 else "BUY"

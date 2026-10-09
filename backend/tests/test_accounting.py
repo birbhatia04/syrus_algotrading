@@ -40,19 +40,19 @@ def test_partial_scenario_leaves_the_unfilled_balance_pending(client, auth):
     assert order["requested_qty"] == 10
 
 
-def test_alpaca_paper_submission_uses_broker_ack_without_simulated_fill(client, auth, monkeypatch):
+def test_upstox_sandbox_submission_uses_broker_ack_without_simulated_fill(client, auth, monkeypatch):
     from app.brokers.contracts import BrokerAcknowledgement
     from app.config import settings
     from app import services
 
     sub = setup_running(client, auth)[0]
-    monkeypatch.setattr(settings, "environment", "ALPACA_PAPER")
-    monkeypatch.setattr(services.alpaca_paper_broker, "place_order", lambda request: BrokerAcknowledgement("alpaca-order-1", "ACKNOWLEDGED"))
+    monkeypatch.setattr(settings, "environment", "UPSTOX_SANDBOX")
+    monkeypatch.setattr(services.upstox_sandbox_broker, "place_order", lambda request: BrokerAcknowledgement("upstox-order-1", "ACKNOWLEDGED"))
     with SessionLocal() as db:
         account = db.get(Account, 1)
         subscription = db.get(Subscription, sub["id"])
-        order = submit_order(db, account, subscription, "BUY", 10, Decimal("100"), client_id="alpaca-test-1")
-        assert order.broker_order_id == "alpaca-order-1"
+        order = submit_order(db, account, subscription, "BUY", 10, Decimal("100"), client_id="upstox-test-1")
+        assert order.broker_order_id == "upstox-order-1"
         assert order.status == "ACKNOWLEDGED"
         assert order.filled_qty == 0
 

@@ -172,7 +172,7 @@ def subscribe(body: SubscribeBody, user: User = Depends(current_user), db: Sessi
     account = user_account(user, db)
     strategy = db.get(Strategy, body.strategy_id)
     if not strategy: raise HTTPException(404, "Strategy not found")
-    symbol = body.symbol or settings.alpaca_default_symbol
+    symbol = body.symbol or settings.upstox_default_symbol
     existing = db.scalar(select(Subscription).where(Subscription.account_id == account.id, Subscription.strategy_id == body.strategy_id))
     if existing:
         if existing.symbol != symbol:
@@ -217,7 +217,7 @@ def dashboard(user: User = Depends(current_user), db: Session = Depends(get_db))
     orders = db.scalars(select(Order).where(Order.account_id == account.id).order_by(Order.created_at.desc()).limit(6)).all()
     subs = db.scalars(select(Subscription).where(Subscription.account_id == account.id)).all()
     session = db.get(SimulatorSession, account.id)
-    return {"environment": settings.environment, "currency": settings.currency, "default_symbol": settings.alpaca_default_symbol if settings.is_alpaca_paper else "RELIANCE", "feed_active": bool(session and session.active), "account": {"id": account.id, "name": account.name, "kill_state": account.kill_state, "recovered": account.recovered, "worker_heartbeat": iso(account.worker_heartbeat)}, "pnl": {k: num(v) for k, v in totals.items() if k != "positions"}, "aggregate_positions": totals["positions"], "running_strategies": sum(1 for s in subs if s.status == "RUNNING"), "subscriptions": len(subs), "recent_orders": [order_json(o) for o in orders]}
+    return {"environment": settings.environment, "currency": settings.currency, "default_symbol": settings.upstox_default_symbol if settings.is_upstox_sandbox else "RELIANCE", "feed_active": bool(session and session.active), "account": {"id": account.id, "name": account.name, "kill_state": account.kill_state, "recovered": account.recovered, "worker_heartbeat": iso(account.worker_heartbeat)}, "pnl": {k: num(v) for k, v in totals.items() if k != "positions"}, "aggregate_positions": totals["positions"], "running_strategies": sum(1 for s in subs if s.status == "RUNNING"), "subscriptions": len(subs), "recent_orders": [order_json(o) for o in orders]}
 
 
 @app.get("/api/v1/orders")
@@ -249,7 +249,7 @@ def risk_events(user: User = Depends(current_user), db: Session = Depends(get_db
 
 @app.get("/api/v1/candles")
 def candles(symbol: Optional[str] = None, timeframe: str = "1m", user: User = Depends(current_user), db: Session = Depends(get_db)):
-    symbol = symbol or settings.alpaca_default_symbol
+    symbol = symbol or settings.upstox_default_symbol
     rows = db.scalars(select(Candle).where(Candle.symbol == symbol, Candle.timeframe == timeframe).order_by(Candle.bucket_start.desc()).limit(100)).all()
     return [{"time": iso(c.bucket_start), "open": num(c.open), "high": num(c.high), "low": num(c.low), "close": num(c.close), "volume": c.volume, "closed": c.closed} for c in reversed(rows)]
 
@@ -273,9 +273,13 @@ def market_feed(user: User = Depends(current_user), db: Session = Depends(get_db
                 "low": num(row.low), "close": num(row.close), "volume": row.volume, "closed": row.closed,
             }
         latest = current or closed
-        items.append({"symbol": symbol, "latest_price": num(latest.close) if latest else None, "current_candle": candle_json(current), "last_closed_candle": candle_json(closed)})
+        latest_price = num(latest.close) if latest else None
+        latest_at = latest.bucket_start if latest else None
+        quote_source = "Upstox live market-data feed" if settings.is_upstox_sandbox else "Stored strategy candle"
+        is_stale = bool(latest_at and datetime.now(timezone.utc) - latest_at > timedelta(minutes=2))
+        items.append({"symbol": symbol, "latest_price": latest_price, "latest_at": iso(latest_at), "stale": is_stale, "quote_source": quote_source, "current_candle": candle_json(current), "last_closed_candle": candle_json(closed)})
     return {
-        "provider": "Alpaca IEX" if settings.is_alpaca_paper else "Deterministic simulator",
+        "provider": "Upstox Market Data Feed V3" if settings.is_upstox_sandbox else "Deterministic simulator",
         "active": bool(session and session.active),
         "symbols": items,
     }
@@ -332,15 +336,15 @@ def simulator_events(user: User = Depends(current_user), db: Session = Depends(g
 @app.post("/api/v1/simulator/stream/{action}")
 def simulator_stream(action: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
     if action not in {"start", "stop"}: raise HTTPException(404, "Unknown stream action")
-    if settings.is_alpaca_paper and not settings.alpaca_configured:
-        raise HTTPException(409, "Alpaca Paper credentials are not configured on the backend")
+    if settings.is_upstox_sandbox and not settings.upstox_configured:
+        raise HTTPException(409, "Upstox Analytics and Sandbox tokens are not configured on the backend")
     account = user_account(user, db)
     session = db.get(SimulatorSession, account.id) or SimulatorSession(account_id=account.id)
     session.active = action == "start"
     if session.active and not session.virtual_time:
         session.virtual_time = datetime.now(timezone.utc).replace(second=0, microsecond=0)
-    label = "Alpaca market feed" if settings.is_alpaca_paper else "Virtual market stream"
-    detail = "Alpaca IEX WebSocket trades feed closed-candle strategies" if settings.is_alpaca_paper else "One simulated minute advances every two seconds"
+    label = "Upstox market feed" if settings.is_upstox_sandbox else "Virtual market stream"
+    detail = "Upstox V3 live ticks feed closed-candle strategies; orders go only to Sandbox" if settings.is_upstox_sandbox else "One simulated minute advances every two seconds"
     db.add(session); record_simulation_event(db, account.id, "STREAM", f"{label} {action}ed", detail)
     db.commit()
     return {"active": session.active, "virtual_time": iso(session.virtual_time)}
