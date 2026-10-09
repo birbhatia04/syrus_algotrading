@@ -32,10 +32,10 @@ def seed_strategies(db: Session):
     ]
     if settings.is_021:
         definitions[0] = (
-            "ma_cross", "Recurring candle momentum", "1m + 5m",
-            "A repeatable intraday strategy driven by platform-built candles.",
-            "On each newly closed 1-minute candle while flat, combine its percentage body with the latest 5-minute candle's percentage body. Buy when the combined bias is non-negative; sell when it is negative. Exit on an opposite 1-minute candle, after 1 minute from the latest fill, or at 15:15 IST. Re-entry is allowed on a later closed candle after the exit is confirmed, up to 6 entry cycles per day; no pyramiding.",
-            {"hold_minutes": 1, "max_cycles": 6, "quantity": 1},
+            "ma_cross", "Dual timeframe candle pulse", "1m + 5m",
+            "A fast demonstration strategy driven by platform-built candles.",
+            "After the first closed 1-minute candle, combine its percentage body with the latest 5-minute candle's percentage body. Buy when the combined bias is non-negative; sell when it is negative. Exit on an opposite 1-minute candle, after 3 minutes from the latest fill, or at 15:15 IST. One entry cycle per day; no pyramiding.",
+            {"hold_minutes": 3, "quantity": 1},
         )
         definitions.extend([
             ("time_entry", "09:15 entry / 15:15 exit", "clock", "One intraday entry, followed by a scheduled square-off.",
@@ -51,14 +51,14 @@ def seed_strategies(db: Session):
             strategy.name, strategy.timeframe, strategy.description, strategy.rules = name, timeframe, description, rules
             strategy.default_parameters = json.dumps(params)
     if settings.is_021:
-        # Existing installations keep subscriptions across deploys. Move the
-        # candle strategy to repeatable demo parameters while preserving size.
+        # Existing installations keep subscriptions across deploys. Replace the
+        # old crossover-only knobs while preserving the user's chosen quantity.
         for sub in db.scalars(select(Subscription).where(Subscription.strategy_id == "ma_cross")).all():
             current = json.loads(sub.parameters)
-            if "max_cycles" not in current or "fast" in current or "slow" in current:
-                sub.parameters = json.dumps({"hold_minutes": 1, "max_cycles": 6, "quantity": int(current.get("quantity", 1))})
+            if "fast" in current or "slow" in current:
+                sub.parameters = json.dumps({"hold_minutes": 3, "quantity": int(current.get("quantity", 1))})
     db.commit()
-
+    
 
 def candle_bucket(ts: datetime, minutes: int) -> datetime:
     ts = ts.astimezone(timezone.utc).replace(second=0, microsecond=0)
