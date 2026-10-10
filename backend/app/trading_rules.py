@@ -184,6 +184,6 @@ def strategy_decision(db, sub, quote, instrument, now):
         opposite_candle = (qty > 0 and one_direction < 0) or (qty < 0 and one_direction > 0)
         if qty and (opposite_candle or timed_exit):
             return Decision(-qty, key, True)
-        if sub.status == "RUNNING" and not qty and entry_count < int(params.get("max_cycles", 6)):
+        if sub.status == "RUNNING" and not qty and entry_count < int(params.get("max_cycles", 12)):
             return Decision(quantity if combined >= 0 else -quantity, key)
     return None

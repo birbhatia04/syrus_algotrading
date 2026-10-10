@@ -111,7 +111,7 @@ def sub_json(db, sub):
             Order.subscription_id == sub.id, Order.close_only.is_(False),
             Order.created_at >= start, Order.status != "RISK_REJECTED",
         )) or 0
-        result["cycle_limit"] = max(1, int(result["parameters"].get("max_cycles", 6)))
+        result["cycle_limit"] = max(1, int(result["parameters"].get("max_cycles", 12)))
     return result
 
 
@@ -317,8 +317,14 @@ def control_subscription(sub_id: int, action: str, user: User = Depends(current_
         bound_account(user, db)
         if sub.strategy_id not in SUPPORTED:
             raise HTTPException(409, "Legacy simulator strategy cannot run against 021")
-        if action == "start" and (not account.recovered or (datetime.now(timezone.utc) - utc(account.worker_heartbeat)).total_seconds() > 5):
-            raise HTTPException(409, "Wait for the worker to reconcile the 021 account")
+        if action == "start":
+            heartbeat_age = (datetime.now(timezone.utc) - utc(account.worker_heartbeat)).total_seconds()
+            if heartbeat_age > 5:
+                raise HTTPException(503, "Execution worker is offline, so waiting will not help. Start the worker (docker compose up -d worker), then retry.", headers={"Retry-After": "5"})
+            if not account.recovered:
+                state = db.get(BrokerState, account.id)
+                reason = state.last_error if state and state.last_error else "the worker is re-syncing broker orders, fills and positions"
+                raise HTTPException(409, f"Reconciling the 021 account: {reason}. This usually clears within a few seconds, so the app will keep retrying automatically.", headers={"Retry-After": "3"})
     if action == "start" and account.kill_state != "RUNNING": raise HTTPException(409, "Reset kill switch before starting")
     sub.status = "RUNNING" if action == "start" else "PAUSED"; db.commit()
     return sub_json(db, sub)

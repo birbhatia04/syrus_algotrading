@@ -1,12 +1,18 @@
 const API = import.meta.env.VITE_API_URL || '/api/v1'
 export const token = () => localStorage.getItem('algorhythm_token') || localStorage.getItem('aegis_token')
+export class ApiError extends Error{
+  status:number
+  retryAfter?:number
+  constructor(message:string,status:number,retryAfter?:number){super(message);this.name='ApiError';this.status=status;this.retryAfter=retryAfter}
+}
 export async function api<T>(path:string, options:RequestInit={}):Promise<T>{
   const response=await fetch(`${API}${path}`,{...options,headers:{'Content-Type':'application/json',...(token()?{Authorization:`Bearer ${token()}`}:{...{}}),...options.headers}})
   if(response.status===204) return undefined as T
   const data=await response.json().catch(()=>({detail:'Request failed'}))
   if(!response.ok){
     const detail=Array.isArray(data.detail)?data.detail.map((e:{msg?:string})=>e.msg||'Invalid value').join('; '):data.detail
-    throw new Error(typeof detail==='string'?detail:'Request failed')
+    const retryAfter=Number(response.headers.get('Retry-After'))||undefined
+    throw new ApiError(typeof detail==='string'?detail:'Request failed',response.status,retryAfter)
   }
   return data
 }
