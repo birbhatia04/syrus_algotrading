@@ -108,6 +108,7 @@ class Execution(Base):
     quantity: Mapped[int] = mapped_column(Integer)
     price: Mapped[Decimal] = mapped_column(Numeric(18, 4))
     charge: Mapped[Decimal] = mapped_column(Numeric(18, 4))
+    charge_breakdown: Mapped[str] = mapped_column(Text, default="{}")
     executed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -122,6 +123,7 @@ class Position(Base):
     average_price: Mapped[Decimal] = mapped_column(Numeric(18, 4), default=Decimal("0"))
     realized_pnl: Mapped[Decimal] = mapped_column(Numeric(18, 4), default=Decimal("0"))
     charges: Mapped[Decimal] = mapped_column(Numeric(18, 4), default=Decimal("0"))
+    charge_breakdown: Mapped[str] = mapped_column(Text, default="{}")
     last_price: Mapped[Decimal] = mapped_column(Numeric(18, 4), default=Decimal("0"))
 
 

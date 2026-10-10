@@ -20,7 +20,7 @@ export function BrokerPanel(){
  return <section className="panel broker-panel">
   <div className="panelhead"><div><h2>021 sandbox connection</h2><p>Virtual funds · NSE cash · INTRADAY</p></div></div>
   <div className="broker-health">
-   {([['Token',status?.configured],['Account bound',status?.bound],['Worker',status?.worker_alive],['Market socket',status?.market_connected],['Orders socket',status?.orders_connected],['Reconciled',status?.reconciled]] as [string,boolean|undefined][]).map(([name,ok])=><span key={name} className={ok?'positive':'negative'}>{name}: {ok?'Ready':'Waiting'}</span>)}
+   {([['Token',status?.configured],['Account bound',status?.bound],['Worker',status?.worker_alive],['Market socket',status?.market_connected],['Orders socket',status?.orders_connected],['Reconciled',status?.reconciled]] as [string,boolean|undefined][]).map(([name,ok])=><span key={name} className={`readiness-chip ${ok?'ready':'waiting'}`}><i aria-hidden="true"/>{name}<strong>{ok?'Ready':'Waiting'}</strong></span>)}
   </div>
   {status?.last_error&&<p role="status" className="broker-warning">{status.last_error}</p>}
   {status?.kill_elapsed_ms!==null&&status?.kill_elapsed_ms!==undefined&&<p>Last confirmed flatten: {(status.kill_elapsed_ms/1000).toFixed(2)} seconds {status.kill_elapsed_ms>10000?'— exceeded 10-second target':''}</p>}

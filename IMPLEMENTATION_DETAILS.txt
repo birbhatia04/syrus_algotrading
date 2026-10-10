@@ -1,0 +1,250 @@
+AlgoRhythm — Project Explanation
+================================
+
+AlgoRhythm is an algorithmic-trading platform built for safely designing, running, and observing automated trading strategies. It is currently connected to Alpaca's Paper Trading environment, so it uses market data and can send simulated buy/sell orders without risking real money.
+
+How it works
+------------
+
+Alpaca market data -> candles -> strategy rules -> risk checks -> Alpaca paper order -> fills/positions/P&L shown in dashboard
+
+The platform lets a user:
+
+- Create an account and complete profile details.
+- Start, pause, and resume automated strategies.
+- Receive live market-feed updates from Alpaca.
+- Turn strategy signals into Alpaca Paper Trading orders.
+- See orders, fills, open positions, profit/loss, charges, and risk decisions.
+- Use an emergency kill switch to stop every strategy, cancel outstanding orders, and close positions.
+- Test unusual trading situations through simulator controls.
+
+Current environment: Alpaca Paper Trading
+-----------------------------------------
+
+The app currently runs in Alpaca Paper mode.
+
+- Prices come from Alpaca's market-data feed.
+- Orders are sent to Alpaca's paper-trading API.
+- Alpaca responds as if trades occurred, but no real money or real shares are involved.
+- The active instrument is AAPL, not RELIANCE.
+
+The earlier RELIANCE implementation was a local, deterministic demo setup. It has been removed from the active app and its old records cleared. Simulator code still exists as a possible fallback, but is not active in the current configuration.
+
+Strategies
+----------
+
+1. Moving Average Crossover
+
+This compares a fast moving average with a slower moving average.
+
+- If the fast average crosses above the slow one, it can generate a buy signal.
+- If it crosses below, it can generate a sell signal.
+- It needs enough completed candles before deciding.
+
+2. RSI Mean Reversion
+
+RSI measures whether price has moved unusually far up or down recently.
+
+- A low RSI can indicate the price is oversold, potentially generating a buy signal.
+- A high RSI can indicate it is overbought, potentially generating a sell signal.
+- It trades only after closed candles.
+
+3. Five-Minute Breakout
+
+This looks for a price move beyond a recent range.
+
+- If a completed five-minute candle closes above the recent high, it can buy.
+- If it closes below the recent low, it can sell.
+- It aims to capture stronger directional moves.
+
+Starting a strategy does not guarantee an immediate order. It needs market data, enough completed candles, a valid signal, and risk approval.
+
+Market data, ticks, and candles
+--------------------------------
+
+A tick is an individual market update, such as a trade-price update.
+
+The worker receives price updates from Alpaca and groups them into time-based candles:
+
+- A 1-minute candle contains open, high, low, and closing price data for one minute.
+- A 5-minute candle contains the same data over five minutes.
+
+Strategies use closed candles because a completed candle has a stable final price.
+
+Orders and fills
+----------------
+
+An order is a request sent to the broker, for example: Buy 10 AAPL shares.
+
+A fill is the quantity the broker has actually executed.
+
+- 10 / 10: all 10 requested shares were executed.
+- 4 / 10: 4 shares executed and 6 remain.
+- 0 / 10: no shares have executed yet.
+
+Order statuses include:
+
+- Filled: the entire requested quantity executed.
+- Partially filled: only some quantity executed.
+- Cancelled: the remaining unfilled quantity was cancelled.
+- Rejected: the broker or risk system did not accept the order.
+- Risk rejected: the platform blocked it before sending it to Alpaca.
+
+The system reconciles Alpaca's current order state with local records so fill quantity and average price remain accurate.
+
+Positions
+---------
+
+A position is the amount of a stock currently owned or sold short.
+
+- Buying 10 AAPL shares creates a +10 AAPL position.
+- Selling those 10 shares returns the position to 0. This is called a flat position.
+- Selling before owning can create a negative/short position, subject to broker rules.
+
+Profit and loss
+---------------
+
+- Realized P&L: profit or loss already locked in after a position is closed.
+- Unrealized P&L: profit or loss on a position that remains open.
+- Net P&L: the combined result after charges.
+
+Conceptually:
+
+Net P&L = realized P&L + unrealized P&L - charges
+
+The charges used by the simulator are simplified testing fees; they are not a statement of actual Alpaca brokerage fees.
+
+Risk system
+-----------
+
+Before allowing an order, AlgoRhythm checks safety conditions. It can block an order if:
+
+- The proposed position would exceed the exposure limit.
+- Market data is stale.
+- The account is halted by the kill switch.
+- The strategy is paused or not subscribed.
+- The order conflicts with the current safety state.
+
+For example, "Proposed exposure 111 exceeds limit 100" means the order would exceed the configured exposure limit, so the platform blocks it.
+
+Pause, resume, and kill switch
+------------------------------
+
+Each strategy can be controlled independently:
+
+- Start: begins strategy activity and may submit approved orders.
+- Pause: stops new activity for that strategy.
+- Resume: restarts a paused or halted strategy after safety checks.
+
+The account-level kill switch:
+
+1. Pauses every strategy.
+2. Cancels outstanding orders.
+3. Attempts to flatten positions, meaning return holdings to zero.
+4. Halts the account to stop new trading activity.
+
+Before an account resumes, the platform checks that positions are flat and that no unresolved/unknown orders remain.
+
+An unknown or unresolved order is an order whose latest broker state cannot be confirmed. This is treated as unsafe because it may still execute.
+
+Reconciliation
+--------------
+
+Reconciliation compares the platform's local records with Alpaca's actual Paper Trading account state.
+
+For example:
+
+Initially: submitted, 0 / 10
+Later:     filled, 10 / 10
+
+Reconciliation refreshes the local data so the dashboard, positions, and P&L use current broker information.
+
+Simulator controls
+------------------
+
+The app contains simulator controls for predictably testing difficult situations. These controls are useful for demonstrations and for validating risk and order handling.
+
+Scenarios include:
+
+- Full fill: the complete order is executed.
+- Partial fill: only part of the requested quantity executes.
+- Rejection: the simulated broker refuses the order.
+- Pending order: the order remains open.
+- Stale feed: market data becomes too old, so new exposure should be blocked.
+- Cancellation race: order state changes around the time a cancellation is requested.
+
+Dashboard pages
+---------------
+
+Overview
+  Shows account health, market-feed status, worker heartbeat, P&L, exposure, active strategies, recent orders, and the account kill switch.
+
+Strategies
+  Explains each strategy's rules and lets users start, pause, resume, or configure strategies where permitted.
+
+Orders
+  Shows the lifecycle of each order: quantity, fill progress, average price, status, rejection reason, and creation time.
+
+Positions
+  Shows current holdings and their trading state.
+
+Risk
+  Shows account safety and decisions made by the risk layer.
+
+Architecture
+------------
+
+Frontend
+  React/Vite dashboard shown in the browser.
+
+Backend API
+  FastAPI service handling accounts, orders, strategies, risk, and dashboard data.
+
+Worker
+  Connects to Alpaca market data, builds candles, evaluates strategies, sends approved paper orders, and reconciles broker state.
+
+Database
+  Stores users, strategies, orders, fills, positions, events, and risk state.
+
+Alpaca Paper APIs
+  Provides AAPL market data and accepts simulated buy/sell orders.
+
+What is implemented
+-------------------
+
+- AlgoRhythm branding and light UI.
+- Account creation, password confirmation, and follow-up customer details.
+- Strategy start/pause/resume controls.
+- Alpaca Paper Trading integration.
+- Alpaca live market feed.
+- AAPL-based strategy workflow.
+- Market-data candles and strategy evaluation on closed candles.
+- Order submission, broker responses, fills, cancellations, and rejections.
+- Local order reconciliation with Alpaca.
+- Position and P&L display.
+- Risk checks and exposure limits.
+- Account kill switch and resume safety checks.
+- Simulator test scenarios.
+- Docker-based local startup.
+- GitHub repository with README and local setup instructions.
+
+What is still not production-ready
+----------------------------------
+
+This is a strong prototype/paper-trading platform, but it is not ready for live-money trading. Important next steps include:
+
+- PostgreSQL deployment and stronger database locking for multiple workers.
+- Database migrations and production backups.
+- Durable real-time events/WebSocket updates for the dashboard.
+- More complete broker error handling and audit logs.
+- Proper authentication security, password hashing review, role permissions, and secrets management.
+- Configurable strategy parameters and more instruments.
+- More accurate fee and tax calculations.
+- Comprehensive automated tests for broker outages, reconnects, duplicate events, and concurrent orders.
+- Monitoring, alerting, rate limiting, and production deployment infrastructure.
+- Thorough compliance, legal, and risk review before connecting any live brokerage account.
+
+Summary
+-------
+
+AlgoRhythm is currently a paper-trading algorithmic execution and monitoring platform. It can receive market data from Alpaca, let strategies make decisions from completed candles, run those decisions through safety checks, send paper orders, and show the entire lifecycle in a dashboard.

@@ -12,15 +12,15 @@ from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 from .config import settings
-from .charges import schedule
+from .charges import breakdown_dict, compute_charges, parse_breakdown, schedule, sum_breakdowns
 from .database import Base, SessionLocal, engine, get_db
 from .models import Account, AuditEvent, Candle, Execution, Order, Position, RiskEvent, Session as AuthSession, SimulationEvent, SimulatorSession, Strategy, Subscription, User, UserProfile
 from .security import create_session, current_user, hash_password, user_account, verify_password
-from .services import aggregate_account, d, evaluate_strategy, ingest_tick, perform_kill, position_values, record_simulation_event, reject_risk, seed_strategies, submit_order
+from .services import aggregate_account, d, evaluate_strategy, ingest_tick, perform_kill, position_values, rebuild_charges, record_simulation_event, reject_risk, seed_strategies, submit_order
 from .models import BrokerState, Instrument, MarketQuote
 from .broker_api import router as broker_router, bound_account, request_kill
 from .engine_021 import lock_account
-from .trading_rules import SUPPORTED, OPEN_STATES, daily_net, sub_position, utc, day_string
+from .trading_rules import SUPPORTED, OPEN_STATES, IST, daily_net, sub_position, utc, day_string
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
@@ -32,6 +32,8 @@ async def lifespan(_app: FastAPI):
             if not settings.is_021:
                 account.recovered = account.kill_state in {"RUNNING", "HALTED"}
         db.commit()
+        for account_id in db.scalars(select(Account.id)).all():
+            rebuild_charges(db, account_id)
     yield
 
 
@@ -101,7 +103,62 @@ def sub_json(db, sub):
     position = sub_position(db, sub)
     net = position_values(position)[1] if position else d(0)
     today = daily_net(db, sub, datetime.now(timezone.utc))
-    return {"id": sub.id, "strategy_id": sub.strategy_id, "name": strategy.name, "timeframe": strategy.timeframe, "symbol": sub.symbol, "status": sub.status, "parameters": json.loads(sub.parameters), "max_daily_loss": num(sub.max_daily_loss), "max_position_size": sub.max_position_size, "max_orders_per_minute": sub.max_orders_per_minute, "quantity": position.quantity if position else 0, "net_pnl": num(net), "daily_net_pnl": num(today)}
+    result = {"id": sub.id, "strategy_id": sub.strategy_id, "name": strategy.name, "timeframe": strategy.timeframe, "symbol": sub.symbol, "status": sub.status, "parameters": json.loads(sub.parameters), "max_daily_loss": num(sub.max_daily_loss), "max_position_size": sub.max_position_size, "max_orders_per_minute": sub.max_orders_per_minute, "quantity": position.quantity if position else 0, "net_pnl": num(net), "daily_net_pnl": num(today)}
+    if settings.is_021 and sub.strategy_id == "ma_cross":
+        now = datetime.now(timezone.utc)
+        start = datetime.combine(now.astimezone(IST).date(), settings.market_open, IST).astimezone(timezone.utc)
+        result["cycle_count"] = db.scalar(select(func.count(Order.id)).where(
+            Order.subscription_id == sub.id, Order.close_only.is_(False),
+            Order.created_at >= start, Order.status != "RISK_REJECTED",
+        )) or 0
+        result["cycle_limit"] = max(1, int(result["parameters"].get("max_cycles", 6)))
+    return result
+
+
+@app.get("/api/v1/notifications")
+def notifications(user: User = Depends(current_user), db: Session = Depends(get_db)):
+    account = user_account(user, db)
+    now = datetime.now(timezone.utc)
+    items = []
+    if settings.is_021:
+        worker_fresh = (now - utc(account.worker_heartbeat)).total_seconds() < 5
+        if not worker_fresh:
+            items.append({"id": "worker-offline", "level": "error", "title": "Execution worker unavailable",
+                          "message": "New entries are blocked. Check the worker and its logs."})
+        elif not account.recovered:
+            items.append({"id": "reconciliation-required", "level": "error", "title": "Reconciliation required",
+                          "message": "New entries are blocked until broker orders, fills and positions agree."})
+    if account.kill_state not in {"RUNNING", "HALTED"}:
+        items.append({"id": f"kill-{account.kill_state}", "level": "error", "title": "Account needs attention",
+                      "message": f"Kill-switch state: {account.kill_state}. Check Overview before resuming."})
+    for sub in db.scalars(select(Subscription).where(Subscription.account_id == account.id)).all():
+        if settings.is_021 and sub.strategy_id == "ma_cross" and sub.status == "RUNNING":
+            info = sub_json(db, sub)
+            if info["cycle_count"] >= info["cycle_limit"]:
+                items.append({"id": f"cycle-limit-{day_string(now)}-{sub.id}", "level": "info",
+                              "title": "Daily cycle limit reached",
+                              "message": f"{info['name']}: {info['cycle_count']} entries today (limit {info['cycle_limit']}). New entries resume next IST day."})
+    cutoff = now - timedelta(minutes=5)
+    for event in db.scalars(select(RiskEvent).where(
+        RiskEvent.account_id == account.id, RiskEvent.created_at >= cutoff
+    ).order_by(RiskEvent.id.desc()).limit(5)).all():
+        items.append({"id": f"risk-{event.id}", "level": "warning", "title": "Trade blocked by risk",
+                      "message": event.message})
+    for order in db.scalars(select(Order).where(
+        Order.account_id == account.id, Order.updated_at >= cutoff,
+        Order.status.in_(["UNKNOWN", "PARTIALLY_FILLED", "REJECTED", "CANCEL_PENDING"])
+    ).order_by(Order.id.desc()).limit(5)).all():
+        if order.status == "UNKNOWN":
+            title, level = "Order outcome unknown", "error"
+        elif order.status == "PARTIALLY_FILLED":
+            title, level = "Order partially filled", "warning"
+        elif order.status == "REJECTED":
+            title, level = "Broker rejected order", "warning"
+        else:
+            title, level = "Cancellation pending", "warning"
+        items.append({"id": f"order-{order.id}-{order.status}", "level": level, "title": title,
+                      "message": f"Order #{order.id}: {order.filled_qty}/{order.requested_qty} filled. {order.reason or ''}".strip()})
+    return items
 
 
 def strategy_labels(db, account_id):
@@ -113,8 +170,33 @@ def strategy_labels(db, account_id):
     return {sub_id: (strategy_id, name) for sub_id, strategy_id, name in rows}
 
 
-def order_json(order, strategy_id=None, strategy_name=None):
-    return {"id": order.id, "subscription_id": order.subscription_id, "strategy_id": strategy_id, "strategy_name": strategy_name, "client_order_id": order.client_order_id, "broker_order_id": order.broker_order_id, "symbol": order.symbol, "side": order.side, "requested_qty": order.requested_qty, "filled_qty": order.filled_qty, "remaining_qty": order.requested_qty - order.filled_qty, "average_fill_price": num(order.average_fill_price), "status": order.status, "reason": order.reason, "close_only": order.close_only, "created_at": iso(order.created_at)}
+def charge_breakdown_json(items):
+    return {key: num(value) for key, value in sum_breakdowns(items).items()}
+
+
+def execution_breakdown(execution, side):
+    return parse_breakdown(execution.charge_breakdown) or breakdown_dict(
+        compute_charges(side, execution.price, execution.quantity)
+    )
+
+
+def order_charge_breakdowns(db, order_ids):
+    if not order_ids:
+        return {}
+    grouped = {}
+    rows = db.execute(
+        select(Execution, Order.side)
+        .join(Order, Order.id == Execution.order_id)
+        .where(Execution.order_id.in_(order_ids))
+    ).all()
+    for execution, side in rows:
+        grouped.setdefault(execution.order_id, []).append(execution_breakdown(execution, side))
+    return {order_id: charge_breakdown_json(items) for order_id, items in grouped.items()}
+
+
+def order_json(order, strategy_id=None, strategy_name=None, charge_breakdown=None):
+    breakdown = charge_breakdown or charge_breakdown_json([])
+    return {"id": order.id, "subscription_id": order.subscription_id, "strategy_id": strategy_id, "strategy_name": strategy_name, "client_order_id": order.client_order_id, "broker_order_id": order.broker_order_id, "symbol": order.symbol, "side": order.side, "requested_qty": order.requested_qty, "filled_qty": order.filled_qty, "remaining_qty": order.requested_qty - order.filled_qty, "average_fill_price": num(order.average_fill_price), "charges": breakdown["total"], "charge_breakdown": breakdown, "status": order.status, "reason": order.reason, "close_only": order.close_only, "created_at": iso(order.created_at)}
 
 
 @app.get("/api/v1/health/live")
@@ -284,21 +366,24 @@ def dashboard(user: User = Depends(current_user), db: Session = Depends(get_db))
     session = db.get(SimulatorSession, account.id)
     broker_state = db.get(BrokerState, account.id)
     active = bool(broker_state and broker_state.enabled) if settings.is_021 else bool(session and session.active)
-    return {"environment": settings.environment, "currency": settings.currency, "default_symbol": settings.broker_021_default_symbol if settings.is_021 else "RELIANCE", "feed_active": active, "charges_assumed": False, "charge_schedule": schedule(), "account": {"id": account.id, "name": account.name, "kill_state": account.kill_state, "recovered": account.recovered and (not settings.is_021 or (datetime.now(timezone.utc) - utc(account.worker_heartbeat)).total_seconds() < 5), "worker_heartbeat": iso(account.worker_heartbeat)}, "pnl": {k: num(v) for k, v in totals.items() if k != "positions"}, "aggregate_positions": totals["positions"], "running_strategies": sum(1 for s in subs if s.status == "RUNNING"), "subscriptions": len(subs), "recent_orders": [order_json(o, *labels.get(o.subscription_id, (None, None))) for o in orders]}
+    breakdowns = order_charge_breakdowns(db, [order.id for order in orders])
+    return {"environment": settings.environment, "currency": settings.currency, "default_symbol": settings.broker_021_default_symbol if settings.is_021 else "RELIANCE", "feed_active": active, "charges_assumed": False, "charge_schedule": schedule(), "account": {"id": account.id, "name": account.name, "kill_state": account.kill_state, "recovered": account.recovered and (not settings.is_021 or (datetime.now(timezone.utc) - utc(account.worker_heartbeat)).total_seconds() < 5), "worker_heartbeat": iso(account.worker_heartbeat)}, "pnl": {k: num(v) for k, v in totals.items() if k != "positions"}, "aggregate_positions": totals["positions"], "running_strategies": sum(1 for s in subs if s.status == "RUNNING"), "subscriptions": len(subs), "recent_orders": [order_json(o, *labels.get(o.subscription_id, (None, None)), breakdowns.get(o.id)) for o in orders]}
 
 
 @app.get("/api/v1/orders")
 def orders(limit: int = Query(100, le=500), user: User = Depends(current_user), db: Session = Depends(get_db)):
     account = user_account(user, db)
     labels = strategy_labels(db, account.id)
-    return [order_json(o, *labels.get(o.subscription_id, (None, None))) for o in db.scalars(select(Order).where(Order.account_id == account.id).order_by(Order.created_at.desc()).limit(limit)).all()]
+    rows = db.scalars(select(Order).where(Order.account_id == account.id).order_by(Order.created_at.desc()).limit(limit)).all()
+    breakdowns = order_charge_breakdowns(db, [order.id for order in rows])
+    return [order_json(o, *labels.get(o.subscription_id, (None, None)), breakdowns.get(o.id)) for o in rows]
 
 
 @app.get("/api/v1/trades")
-def trades(user: User = Depends(current_user), db: Session = Depends(get_db)):
+def trades(limit: int = Query(100, le=500), user: User = Depends(current_user), db: Session = Depends(get_db)):
     account = user_account(user, db); labels = strategy_labels(db, account.id)
-    rows = db.execute(select(Execution, Order).join(Order, Execution.order_id == Order.id).where(Execution.account_id == account.id).order_by(Execution.executed_at.desc())).all()
-    return [{"id": e.id, "execution_id": e.execution_id, "order_id": o.id, "subscription_id": o.subscription_id, "strategy_id": labels.get(o.subscription_id, (None, None))[0], "strategy_name": labels.get(o.subscription_id, (None, None))[1], "symbol": o.symbol, "side": o.side, "quantity": e.quantity, "price": num(e.price), "charge": num(e.charge), "executed_at": iso(e.executed_at)} for e, o in rows]
+    rows = db.execute(select(Execution, Order).join(Order, Execution.order_id == Order.id).where(Execution.account_id == account.id).order_by(Execution.executed_at.desc()).limit(limit)).all()
+    return [{"id": e.id, "execution_id": e.execution_id, "order_id": o.id, "subscription_id": o.subscription_id, "strategy_id": labels.get(o.subscription_id, (None, None))[0], "strategy_name": labels.get(o.subscription_id, (None, None))[1], "symbol": o.symbol, "side": o.side, "quantity": e.quantity, "price": num(e.price), "charge": num(e.charge), "charge_breakdown": charge_breakdown_json([execution_breakdown(e, o.side)]), "executed_at": iso(e.executed_at)} for e, o in rows]
 
 
 @app.get("/api/v1/positions")
@@ -306,7 +391,8 @@ def positions(user: User = Depends(current_user), db: Session = Depends(get_db))
     account = user_account(user, db); result=[]
     for p in db.scalars(select(Position).where(Position.account_id == account.id)).all():
         sub = db.get(Subscription, p.subscription_id); strategy = db.get(Strategy, sub.strategy_id); unrealized, net = position_values(p)
-        result.append({"id": p.id, "subscription_id": p.subscription_id, "strategy": strategy.name, "symbol": p.symbol, "quantity": p.quantity, "average_price": num(p.average_price), "last_price": num(p.last_price), "realized_pnl": num(p.realized_pnl), "unrealized_pnl": num(unrealized), "charges": num(p.charges), "net_pnl": num(net)})
+        breakdown = parse_breakdown(p.charge_breakdown) or sum_breakdowns([])
+        result.append({"id": p.id, "subscription_id": p.subscription_id, "strategy": strategy.name, "symbol": p.symbol, "quantity": p.quantity, "average_price": num(p.average_price), "last_price": num(p.last_price), "realized_pnl": num(p.realized_pnl), "unrealized_pnl": num(unrealized), "charges": num(p.charges), "charge_breakdown": charge_breakdown_json([breakdown]), "net_pnl": num(net)})
     return {"strategy_positions": result, "account": {k: (num(v) if k != "positions" else v) for k, v in aggregate_account(db, account.id).items()}}
 
 

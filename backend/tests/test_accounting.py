@@ -1,8 +1,10 @@
 from decimal import Decimal
+import pytest
 from sqlalchemy import select
 from app.database import SessionLocal
 from app.models import Account, Execution, Position, Subscription
-from app.services import apply_fill, submit_order
+from app.config import settings
+from app.services import apply_fill, rebuild_charges, submit_order
 
 
 def setup_running(client, auth):
@@ -107,3 +109,75 @@ def test_itemised_intraday_charges_follow_the_published_schedule():
     assert sell.total == sell.brokerage + sell.stt + sell.exchange_txn + sell.sebi + sell.ipft + sell.stamp_duty + sell.gst
     capped = compute_charges("BUY", Decimal("1000000"), 1)
     assert capped.brokerage == Decimal("20")
+
+
+def test_order_execution_and_position_endpoints_expose_charge_breakdowns(client, auth):
+    sub = setup_running(client, auth)[0]
+    created = client.post("/api/v1/simulator/orders", headers=auth, json={
+        "subscription_id": sub["id"], "side": "BUY", "quantity": 10, "price": 100, "scenario": "full"
+    }).json()
+
+    order = next(item for item in client.get("/api/v1/orders", headers=auth).json() if item["id"] == created["id"])
+    execution = next(item for item in client.get("/api/v1/trades", headers=auth).json() if item["order_id"] == created["id"])
+    position = next(item for item in client.get("/api/v1/positions", headers=auth).json()["strategy_positions"] if item["subscription_id"] == sub["id"])
+
+    charge_keys = {"turnover", "brokerage", "stt", "exchange_txn", "sebi", "ipft", "stamp_duty", "gst", "total"}
+    assert set(order["charge_breakdown"]) == charge_keys
+    assert order["charges"] == order["charge_breakdown"]["total"] > 0
+    assert execution["charge"] == execution["charge_breakdown"]["total"]
+    assert position["charges"] == position["charge_breakdown"]["total"]
+    assert order["charge_breakdown"]["stt"] == 0
+    assert order["charge_breakdown"]["stamp_duty"] > 0
+
+
+def test_breakdowns_aggregate_multiple_buy_and_sell_fills(client, auth):
+    sub = setup_running(client, auth)[0]
+    buy = client.post("/api/v1/simulator/orders", headers=auth, json={
+        "subscription_id": sub["id"], "side": "BUY", "quantity": 10, "price": 100, "scenario": "pending"
+    }).json()
+    with SessionLocal() as db:
+        from app.models import Order
+        row = db.get(Order, buy["id"])
+        assert apply_fill(db, row, "buy-1", 4, Decimal("100"))
+        assert apply_fill(db, row, "buy-2", 6, Decimal("102"))
+    sell = client.post("/api/v1/simulator/orders", headers=auth, json={
+        "subscription_id": sub["id"], "side": "SELL", "quantity": 3, "price": 105, "scenario": "full"
+    }).json()
+
+    orders = {item["id"]: item for item in client.get("/api/v1/orders", headers=auth).json()}
+    position = next(item for item in client.get("/api/v1/positions", headers=auth).json()["strategy_positions"] if item["subscription_id"] == sub["id"])
+    assert orders[buy["id"]]["charge_breakdown"]["turnover"] == 1012
+    assert orders[sell["id"]]["charge_breakdown"]["stt"] > 0
+    assert orders[sell["id"]]["charge_breakdown"]["stamp_duty"] == 0
+    for key in orders[buy["id"]]["charge_breakdown"]:
+        assert position["charge_breakdown"][key] == pytest.approx(
+            orders[buy["id"]]["charge_breakdown"][key] + orders[sell["id"]]["charge_breakdown"][key]
+        )
+
+
+def test_charge_snapshots_survive_schedule_changes(client, auth, monkeypatch):
+    sub = setup_running(client, auth)[0]
+    created = client.post("/api/v1/simulator/orders", headers=auth, json={
+        "subscription_id": sub["id"], "side": "BUY", "quantity": 10, "price": 100, "scenario": "full"
+    }).json()
+    before = next(item for item in client.get("/api/v1/orders", headers=auth).json() if item["id"] == created["id"])
+
+    monkeypatch.setattr(settings, "brokerage_rate", Decimal("0.1"))
+    account_id = client.get("/api/v1/me", headers=auth).json()["account"]["id"]
+    with SessionLocal() as db:
+        rebuild_charges(db, account_id)
+
+    after = next(item for item in client.get("/api/v1/orders", headers=auth).json() if item["id"] == created["id"])
+    position = next(item for item in client.get("/api/v1/positions", headers=auth).json()["strategy_positions"] if item["subscription_id"] == sub["id"])
+    assert after["charge_breakdown"] == before["charge_breakdown"]
+    assert position["charge_breakdown"] == before["charge_breakdown"]
+
+
+def test_unfilled_order_has_zero_charge_breakdown(client, auth):
+    sub = setup_running(client, auth)[0]
+    created = client.post("/api/v1/simulator/orders", headers=auth, json={
+        "subscription_id": sub["id"], "side": "BUY", "quantity": 10, "price": 100, "scenario": "reject"
+    }).json()
+    order = next(item for item in client.get("/api/v1/orders", headers=auth).json() if item["id"] == created["id"])
+    assert order["charges"] == 0
+    assert all(value == 0 for value in order["charge_breakdown"].values())

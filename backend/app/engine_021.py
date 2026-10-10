@@ -243,9 +243,8 @@ class TradingEngine:
                         f"INTRADAY broker trade {trade['tradeId']} for token "
                         f"{trade.get('token')} is missing from the strategy ledger"
                     )
-            # Charges are derived data: recompute each execution from its
-            # immutable price/quantity/side against the active schedule after any
-            # broker timestamp normalization, and rebuild position/day totals.
+            # Rebuild position/day totals from each execution's immutable fee
+            # snapshot after any broker timestamp normalization.
             rebuild_charges(db, account.id)
             local = {}
             for position in db.scalars(select(Position).where(Position.account_id == account.id)).all():

@@ -9,7 +9,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from .brokers import simulator_broker
 from .brokers.contracts import BrokerOrderRequest
-from .charges import charge_for
+from .charges import breakdown_dict, compute_charges, parse_breakdown, serialize_breakdown, sum_breakdowns
 from .config import settings
 from .models import Account, AuditEvent, Candle, Execution, Order, Position, RiskEvent, SimulationEvent, Strategy, Subscription, StrategyDay
 
@@ -148,8 +148,9 @@ def apply_fill(db: Session, order: Order, execution_id: str, qty: int, price: De
     price = d(price)
     # Charges come from the published itemised schedule (app/charges.py), applied
     # per fill to that fill's own turnover.
-    charge = charge_for(order.side, price, qty)
-    execution = Execution(account_id=order.account_id, order_id=order.id, execution_id=execution_id, quantity=qty, price=price, charge=charge, executed_at=executed_at)
+    breakdown = compute_charges(order.side, price, qty)
+    charge = breakdown.total
+    execution = Execution(account_id=order.account_id, order_id=order.id, execution_id=execution_id, quantity=qty, price=price, charge=charge, charge_breakdown=serialize_breakdown(breakdown), executed_at=executed_at)
     db.add(execution)
     position = db.scalar(select(Position).where(Position.account_id == order.account_id, Position.subscription_id == order.subscription_id, Position.symbol == order.symbol))
     if not position:
@@ -174,6 +175,8 @@ def apply_fill(db: Session, order: Order, execution_id: str, qty: int, price: De
     position.quantity = new_qty
     position.last_price = price
     position.charges = d(position.charges + charge)
+    position_breakdown = parse_breakdown(position.charge_breakdown) or sum_breakdowns([])
+    position.charge_breakdown = serialize_breakdown(sum_breakdowns([position_breakdown, breakdown_dict(breakdown)]))
     trading_day = executed_at.astimezone(IST).date().isoformat()
     ledger = db.scalar(select(StrategyDay).where(StrategyDay.subscription_id == order.subscription_id, StrategyDay.trading_day == trading_day))
     if not ledger:
@@ -196,29 +199,34 @@ def apply_fill(db: Session, order: Order, execution_id: str, qty: int, price: De
 
 
 def rebuild_charges(db: Session, account_id: int) -> None:
-    """Charges are derived data: recompute every execution from its immutable
-    price/quantity/side against the active published schedule, then rebuild the
-    strategy position and daily-charge totals from that ledger. This keeps a
-    deployment that changes the schedule self-consistent after the fact."""
+    """Rebuild aggregates from immutable per-fill fee snapshots.
+
+    Legacy executions without a snapshot are backfilled once from the active
+    schedule; completed fills with a snapshot never change when rates change.
+    """
     rows = db.execute(
-        select(Order.subscription_id, Order.symbol, Order.side, Execution.id,
-               Execution.price, Execution.quantity, Execution.charge, Execution.executed_at)
+        select(Order.subscription_id, Order.symbol, Order.side, Execution,
+               Execution.price, Execution.quantity, Execution.executed_at)
         .join(Execution, Execution.order_id == Order.id)
         .where(Order.account_id == account_id)
     ).all()
-    position_totals: dict[tuple[int, str], Decimal] = {}
+    position_breakdowns: dict[tuple[int, str], list[dict[str, Decimal]]] = {}
     day_totals: dict[tuple[int, str], Decimal] = {}
-    for sub_id, symbol, side, execution_id, price, qty, stored, executed_at in rows:
-        charge = charge_for(side, price, qty)
-        if charge != d(stored):
-            execution = db.get(Execution, execution_id)
-            if execution:
-                execution.charge = charge
-        position_totals[(sub_id, symbol)] = d(position_totals.get((sub_id, symbol), Decimal("0")) + charge)
+    for sub_id, symbol, side, execution, price, qty, executed_at in rows:
+        breakdown = parse_breakdown(execution.charge_breakdown)
+        if breakdown is None:
+            calculated = compute_charges(side, price, qty)
+            breakdown = breakdown_dict(calculated)
+            execution.charge = calculated.total
+            execution.charge_breakdown = serialize_breakdown(calculated)
+        charge = breakdown["total"]
+        position_breakdowns.setdefault((sub_id, symbol), []).append(breakdown)
         bucket = (sub_id, executed_at.astimezone(IST).date().isoformat())
         day_totals[bucket] = d(day_totals.get(bucket, Decimal("0")) + charge)
     for position in db.scalars(select(Position).where(Position.account_id == account_id)).all():
-        position.charges = position_totals.get((position.subscription_id, position.symbol), Decimal("0"))
+        breakdown = sum_breakdowns(position_breakdowns.get((position.subscription_id, position.symbol), []))
+        position.charges = breakdown["total"]
+        position.charge_breakdown = serialize_breakdown(breakdown)
     ledgers = {(ledger.subscription_id, ledger.trading_day): ledger for ledger in db.scalars(
         select(StrategyDay).join(Subscription, Subscription.id == StrategyDay.subscription_id)
         .where(Subscription.account_id == account_id)).all()}
